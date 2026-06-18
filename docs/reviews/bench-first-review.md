@@ -73,7 +73,7 @@ Fix:
 
 collect_matching_docs() collects ALL matching doc_ids (and scores) into unbounded
 Vec<u32>/Vec<f32> before returning. For a 10M-match segment: ~80MB allocated before the first
-batch is emitted. This violates the CLAUDE.md rule verbatim.
+batch is emitted. This violates the allocation guidance in `AGENTS.md`.
 
 The TopK path (lines 72-110) is bounded by K and is fine. Three paths need fixing:
 
@@ -378,7 +378,7 @@ Prompt to address this:
 Low / Info
 
  • Arc::clone style: The codebase uses .clone() on Arc types in ~20+ locations instead of
-   Arc::clone(&x). CLAUDE.md prefers the explicit form for clarity. Low priority but a
+   Arc::clone(&x). `AGENTS.md` prefers the explicit form for clarity. Low priority but a
    cleanup candidate.
  • full_text() UDF docstring/impl mismatch (src/full_text_udf.rs:62): The docstring says
    "returns true for every row as a safe fallback" but invoke_with_args() returns Err(...).
@@ -444,4 +444,3 @@ What's Done Well
    ensures warmup runs at most once across partitions.
  • Aggregation uses Searcher::search(): Correctly relies on tantivy's built-in alive_bitset
    filtering in the collector framework rather than reimplementing it.
-
