@@ -338,7 +338,7 @@ fn translate_partition_stat(
     })
 }
 
-/// A single-table DataFusion provider for tantivy indexes.
+/// A DataFusion table provider for tantivy indexes.
 ///
 /// Unlike earlier decomposed providers that joined separate data sources with
 /// `HashJoinExec`, this provider handles FTS queries, fast field reading,
@@ -358,7 +358,7 @@ fn translate_partition_stat(
 /// WHERE full_text(category, 'books') AND price > 2
 /// ORDER BY _score DESC LIMIT 10
 /// ```
-pub struct SingleTableProvider {
+pub struct TantivyTableProvider {
     splits: Vec<PlannedSplit>,
     unified_schema: SchemaRef,
     fast_field_schema: SchemaRef,
@@ -367,7 +367,7 @@ pub struct SingleTableProvider {
     local_runtime_factory: Option<SplitRuntimeFactoryRef>,
 }
 
-impl SingleTableProvider {
+impl TantivyTableProvider {
     /// Create a provider from an already-opened tantivy index.
     #[must_use]
     pub fn new(index: Index) -> Self {
@@ -405,7 +405,7 @@ impl SingleTableProvider {
     fn from_local_split_openers(split_openers: Vec<Arc<dyn IndexOpener>>) -> Result<Self> {
         if split_openers.is_empty() {
             return Err(DataFusionError::Plan(
-                "SingleTableProvider requires at least one local split".into(),
+                "TantivyTableProvider requires at least one local split".into(),
             ));
         }
 
@@ -423,7 +423,7 @@ impl SingleTableProvider {
     ) -> Result<Self> {
         if split_openers.is_empty() {
             return Err(DataFusionError::Plan(
-                "SingleTableProvider requires at least one local split".into(),
+                "TantivyTableProvider requires at least one local split".into(),
             ));
         }
 
@@ -454,7 +454,7 @@ impl SingleTableProvider {
     pub fn from_split_descriptors(split_descriptors: Vec<SplitDescriptor>) -> Result<Self> {
         if split_descriptors.is_empty() {
             return Err(DataFusionError::Plan(
-                "SingleTableProvider requires at least one split descriptor".into(),
+                "TantivyTableProvider requires at least one split descriptor".into(),
             ));
         }
 
@@ -472,7 +472,7 @@ impl SingleTableProvider {
     ) -> Result<Self> {
         if split_descriptors.is_empty() {
             return Err(DataFusionError::Plan(
-                "SingleTableProvider requires at least one split descriptor".into(),
+                "TantivyTableProvider requires at least one split descriptor".into(),
             ));
         }
 
@@ -673,9 +673,9 @@ fn scan_partition_stats(
         .collect()
 }
 
-impl fmt::Debug for SingleTableProvider {
+impl fmt::Debug for TantivyTableProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SingleTableProvider")
+        f.debug_struct("TantivyTableProvider")
             .field("splits", &self.splits.len())
             .field("unified_schema", &self.unified_schema)
             .field("fast_field_schema", &self.fast_field_schema)
@@ -686,7 +686,7 @@ impl fmt::Debug for SingleTableProvider {
 }
 
 #[async_trait]
-impl TableProvider for SingleTableProvider {
+impl TableProvider for TantivyTableProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -734,7 +734,7 @@ impl TableProvider for SingleTableProvider {
             .collect();
         let partition_stats = scan_partition_stats(&self.splits, &schema.ff_projected);
 
-        let data_source = SingleTableDataSource {
+        let data_source = TantivyDataSource {
             splits: split_execution_plans(&self.splits),
             schema,
             raw_queries: pushed.raw_queries,
@@ -776,7 +776,7 @@ pub(crate) struct ScanSchema {
     pub(crate) needs_document: bool,
 }
 
-pub(crate) struct SingleTableCodecFields {
+pub(crate) struct TantivyCodecFields {
     pub(crate) splits: Vec<SplitExecutionPlan>,
     pub(crate) schema: ScanSchema,
     pub(crate) raw_queries: Vec<(String, String)>,
@@ -788,7 +788,7 @@ pub(crate) struct SingleTableCodecFields {
     pub(crate) partition_map: Vec<PartitionSpec>,
 }
 
-pub struct SingleTableDataSource {
+pub struct TantivyDataSource {
     splits: Vec<SplitExecutionPlan>,
     schema: ScanSchema,
     raw_queries: Vec<(String, String)>,
@@ -816,7 +816,7 @@ pub struct SingleTableDataSource {
 
 type BatchSender = tokio::sync::mpsc::Sender<Result<RecordBatch>>;
 
-struct SingleTableOpenInput {
+struct TantivyOpenInput {
     context: Arc<datafusion::execution::TaskContext>,
     sync_pool: crate::sync_exec::SyncExecutionPoolRef,
     split: SplitExecutionPlan,
@@ -842,7 +842,7 @@ struct SingleTableOpenInput {
     cancelled: Arc<AtomicBool>,
 }
 
-struct SingleTableWarmupInput {
+struct TantivyWarmupInput {
     searcher: tantivy::Searcher,
     tantivy_schema: TantivySchema,
     source_ff_schema: SchemaRef,
@@ -875,9 +875,9 @@ struct BlockingScanInput {
     projected_schema: SchemaRef,
 }
 
-impl fmt::Debug for SingleTableDataSource {
+impl fmt::Debug for TantivyDataSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SingleTableDataSource")
+        f.debug_struct("TantivyDataSource")
             .field("splits", &self.splits.len())
             .field("schema", &self.schema.projected)
             .field("topk", &self.topk)
@@ -887,11 +887,11 @@ impl fmt::Debug for SingleTableDataSource {
     }
 }
 
-impl SingleTableDataSource {
-    /// Construct a `SingleTableDataSource` directly from deserialized codec
+impl TantivyDataSource {
+    /// Construct a `TantivyDataSource` directly from deserialized codec
     /// fields, bypassing `TableProvider::scan` and `SessionContext`. Used by
     /// `TantivyCodec::try_decode` to reconstruct a `DataSourceExec` on workers.
-    pub(crate) fn new_from_codec(fields: SingleTableCodecFields) -> Self {
+    pub(crate) fn new_from_codec(fields: TantivyCodecFields) -> Self {
         let warmup_done = fields
             .splits
             .iter()
@@ -923,7 +923,7 @@ impl SingleTableDataSource {
     }
 
     fn clone_with(&self, f: impl FnOnce(&mut Self)) -> Self {
-        let mut new = SingleTableDataSource {
+        let mut new = TantivyDataSource {
             splits: self.splits.clone(),
             schema: self.schema.clone(),
             raw_queries: self.raw_queries.clone(),
@@ -948,7 +948,7 @@ impl SingleTableDataSource {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
         cancelled: Arc<AtomicBool>,
-    ) -> Result<SingleTableOpenInput> {
+    ) -> Result<TantivyOpenInput> {
         let partition_spec = *self.partition_map.get(partition).ok_or_else(|| {
             DataFusionError::Internal(format!("invalid partition index {partition}"))
         })?;
@@ -971,7 +971,7 @@ impl SingleTableDataSource {
         };
         let needs_warmup = split_needs_warmup(&split);
 
-        Ok(SingleTableOpenInput {
+        Ok(TantivyOpenInput {
             sync_pool: crate::sync_exec::get_or_default_pool(context.as_ref()),
             split,
             local_runtime_factory: self.local_runtime_factory.clone(),
@@ -1238,18 +1238,18 @@ fn split_needs_warmup(split: &SplitExecutionPlan) -> bool {
     split.needs_warmup
 }
 
-fn spawn_single_table_open_task(
-    input: SingleTableOpenInput,
+fn spawn_tantivy_table_open_task(
+    input: TantivyOpenInput,
     tx: BatchSender,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(err) = run_single_table_open_task(input, tx.clone()).await {
+        if let Err(err) = run_tantivy_table_open_task(input, tx.clone()).await {
             let _ = tx.send(Err(err)).await;
         }
     })
 }
 
-async fn run_single_table_open_task(input: SingleTableOpenInput, tx: BatchSender) -> Result<()> {
+async fn run_tantivy_table_open_task(input: TantivyOpenInput, tx: BatchSender) -> Result<()> {
     let prepared = prepare_split(
         &input.split,
         input.local_runtime_factory.as_ref(),
@@ -1274,9 +1274,9 @@ async fn run_single_table_open_task(input: SingleTableOpenInput, tx: BatchSender
         plan_fast_field_projection(&source_ff_schema, &input.ff_projected_schema)?;
 
     if input.needs_warmup {
-        warmup_single_table_split(
+        warmup_tantivy_table_split(
             Arc::clone(&input.warmup_done),
-            SingleTableWarmupInput {
+            TantivyWarmupInput {
                 searcher: prepared.searcher().clone(),
                 tantivy_schema: prepared.index().schema(),
                 source_ff_schema: source_ff_schema.clone(),
@@ -1314,9 +1314,9 @@ async fn run_single_table_open_task(input: SingleTableOpenInput, tx: BatchSender
     run_blocking_scan_and_forward(scan_input, tx).await
 }
 
-async fn warmup_single_table_split(
+async fn warmup_tantivy_table_split(
     warmup_done: Arc<tokio::sync::OnceCell<()>>,
-    input: SingleTableWarmupInput,
+    input: TantivyWarmupInput,
 ) -> Result<()> {
     warmup_done
         .get_or_try_init(|| async move {
@@ -1422,7 +1422,7 @@ async fn run_blocking_scan_and_forward(input: BlockingScanInput, tx: BatchSender
                     query,
                     cancelled,
                 };
-                generate_single_table_batch_streaming(&cfg, |batch| {
+                generate_tantivy_table_batch_streaming(&cfg, |batch| {
                     raw_tx.blocking_send(Ok(batch)).is_ok()
                 })?;
                 Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
@@ -1457,7 +1457,7 @@ async fn run_blocking_scan_and_forward(input: BlockingScanInput, tx: BatchSender
     }
 }
 
-impl DataSource for SingleTableDataSource {
+impl DataSource for TantivyDataSource {
     fn open(
         &self,
         partition: usize,
@@ -1468,7 +1468,7 @@ impl DataSource for SingleTableDataSource {
         let cancelled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
         let input = self.open_input(partition, context, Arc::clone(&cancelled))?;
-        let handle = spawn_single_table_open_task(input, tx);
+        let handle = spawn_tantivy_table_open_task(input, tx);
         let guard = AbortOnDrop { handle, cancelled };
 
         let stream = futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
@@ -1492,7 +1492,7 @@ impl DataSource for SingleTableDataSource {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "SingleTableDataSource(partitions={}, query={}, score={}, document={}, topk={:?})",
+            "TantivyDataSource(partitions={}, query={}, score={}, document={}, topk={:?})",
             self.partition_map.len(),
             self.has_query(),
             self.schema.needs_score,
@@ -1846,7 +1846,7 @@ struct ScanConfig {
 
 /// Thin orchestrator: query execution is delegated to the streaming helpers in
 /// [`crate::util`] and batch assembly to [`ChunkBuilder::build`].
-fn generate_single_table_batch_streaming(
+fn generate_tantivy_table_batch_streaming(
     cfg: &ScanConfig,
     mut emit: impl FnMut(RecordBatch) -> bool,
 ) -> Result<()> {

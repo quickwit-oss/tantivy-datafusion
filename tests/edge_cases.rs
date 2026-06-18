@@ -7,7 +7,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::*;
 use tantivy::schema::{Field, SchemaBuilder, Term, FAST, STORED, TEXT};
 use tantivy::{DateTime, Index, IndexWriter, TantivyDocument};
-use tantivy_datafusion::{full_text_udf, AggPushdown, SingleTableProvider};
+use tantivy_datafusion::{full_text_udf, AggPushdown, TantivyTableProvider};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -92,9 +92,9 @@ fn add_test_documents(
     }
 }
 
-/// Create a session context with optimizer rules and SingleTableProvider.
+/// Create a session context with optimizer rules and TantivyTableProvider.
 fn setup_ctx(index: Index) -> SessionContext {
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
     let config = SessionConfig::new().with_target_partitions(1);
     let state = SessionStateBuilder::new()
         .with_config(config)

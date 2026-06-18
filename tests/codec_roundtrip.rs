@@ -14,11 +14,11 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use tantivy::schema::{SchemaBuilder, FAST, STORED, STRING, TEXT};
 use tantivy::{DateTime, Index, IndexWriter, TantivyDocument};
-use tantivy_datafusion::unified::agg_data_source::{AggDataSource, AggOutputMode};
-use tantivy_datafusion::unified::single_table_provider::SingleTableDataSource;
+use tantivy_datafusion::unified::tantivy_agg_data_source::{AggOutputMode, TantivyAggDataSource};
+use tantivy_datafusion::unified::tantivy_table_provider::TantivyDataSource;
 use tantivy_datafusion::{
-    full_text_udf, PreparedSplit, SingleTableProvider, SplitDescriptor, SplitRuntimeFactory,
-    SplitRuntimeFactoryExt, TantivyCodec,
+    full_text_udf, PreparedSplit, SplitDescriptor, SplitRuntimeFactory, SplitRuntimeFactoryExt,
+    TantivyCodec, TantivyTableProvider,
 };
 
 #[derive(Debug)]
@@ -135,19 +135,19 @@ fn data_source_exec(plan: &Arc<dyn ExecutionPlan>) -> &DataSourceExec {
     plan.as_any().downcast_ref::<DataSourceExec>().unwrap()
 }
 
-fn single_table_ds(plan: &Arc<dyn ExecutionPlan>) -> &SingleTableDataSource {
+fn tantivy_ds(plan: &Arc<dyn ExecutionPlan>) -> &TantivyDataSource {
     data_source_exec(plan)
         .data_source()
         .as_any()
-        .downcast_ref::<SingleTableDataSource>()
+        .downcast_ref::<TantivyDataSource>()
         .unwrap()
 }
 
-fn agg_ds(plan: &Arc<dyn ExecutionPlan>) -> &AggDataSource {
+fn agg_ds(plan: &Arc<dyn ExecutionPlan>) -> &TantivyAggDataSource {
     data_source_exec(plan)
         .data_source()
         .as_any()
-        .downcast_ref::<AggDataSource>()
+        .downcast_ref::<TantivyAggDataSource>()
         .unwrap()
 }
 
@@ -189,12 +189,12 @@ fn create_float_score_index(start_id: u64) -> Index {
     index
 }
 
-// ── SingleTable provider roundtrip ───────────────────────────────
+// ── TantivyTable provider roundtrip ───────────────────────────────
 
 #[tokio::test]
-async fn test_single_table_roundtrip() {
+async fn test_tantivy_table_roundtrip() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index.clone());
+    let provider = TantivyTableProvider::new(index.clone());
 
     let session = SessionContext::new();
     let state = session.state();
@@ -226,9 +226,9 @@ async fn test_single_table_roundtrip() {
 }
 
 #[tokio::test]
-async fn test_single_table_with_projection_roundtrip() {
+async fn test_tantivy_table_with_projection_roundtrip() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index.clone());
+    let provider = TantivyTableProvider::new(index.clone());
 
     let session = SessionContext::new();
     let state = session.state();
@@ -255,9 +255,9 @@ async fn test_single_table_with_projection_roundtrip() {
 }
 
 #[tokio::test]
-async fn test_single_table_with_query_roundtrip() {
+async fn test_tantivy_table_with_query_roundtrip() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index.clone());
+    let provider = TantivyTableProvider::new(index.clone());
 
     let session = SessionContext::new();
     session.register_udf(full_text_udf());
@@ -281,9 +281,9 @@ async fn test_single_table_with_query_roundtrip() {
 }
 
 #[tokio::test]
-async fn test_single_table_with_topk_roundtrip() {
+async fn test_tantivy_table_with_topk_roundtrip() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index.clone());
+    let provider = TantivyTableProvider::new(index.clone());
 
     let session = SessionContext::new();
     session.register_udf(full_text_udf());
@@ -295,12 +295,12 @@ async fn test_single_table_with_topk_roundtrip() {
     ));
     let exec = provider.scan(&state, None, &[filter], None).await.unwrap();
 
-    // Manually set topk on the SingleTableDataSource.
+    // Manually set topk on the TantivyDataSource.
     let ds_exec = exec.as_any().downcast_ref::<DataSourceExec>().unwrap();
     let st_ds = ds_exec
         .data_source()
         .as_any()
-        .downcast_ref::<SingleTableDataSource>()
+        .downcast_ref::<TantivyDataSource>()
         .unwrap();
     let updated_ds = st_ds.with_topk(10);
     assert_eq!(updated_ds.topk(), Some(10));
@@ -315,25 +315,25 @@ async fn test_single_table_with_topk_roundtrip() {
     let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
 
     assert_eq!(decoded.schema(), exec_with_topk.schema());
-    assert_eq!(single_table_ds(&decoded).topk(), Some(10));
+    assert_eq!(tantivy_ds(&decoded).topk(), Some(10));
 }
 
 #[tokio::test]
-async fn test_single_table_with_row_limit_roundtrip() {
+async fn test_tantivy_table_with_row_limit_roundtrip() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index.clone());
+    let provider = TantivyTableProvider::new(index.clone());
     let session = SessionContext::new();
     let state = session.state();
 
     let exec = provider.scan(&state, None, &[], Some(7)).await.unwrap();
-    assert_eq!(single_table_ds(&exec).row_limit(), Some(7));
+    assert_eq!(tantivy_ds(&exec).row_limit(), Some(7));
 
     let decoded = roundtrip_exec(exec, index);
-    assert_eq!(single_table_ds(&decoded).row_limit(), Some(7));
+    assert_eq!(tantivy_ds(&decoded).row_limit(), Some(7));
 }
 
 #[tokio::test]
-async fn test_multi_split_single_table_roundtrip() {
+async fn test_multi_split_tantivy_table_roundtrip() {
     let left = create_int_score_index(0);
     let right = create_float_score_index(100);
 
@@ -342,7 +342,7 @@ async fn test_multi_split_single_table_roundtrip() {
         Field::new("score", DataType::Float64, true),
     ]));
 
-    let provider = SingleTableProvider::from_local_splits_with_fast_field_schema(
+    let provider = TantivyTableProvider::from_local_splits_with_fast_field_schema(
         vec![left.clone(), right.clone()],
         canonical_schema,
     )
@@ -364,7 +364,7 @@ async fn test_multi_split_single_table_roundtrip() {
         .try_decode(&buf, &[], &decode_session.state().task_ctx())
         .unwrap();
 
-    let decoded_ds = single_table_ds(&decoded);
+    let decoded_ds = tantivy_ds(&decoded);
     assert_eq!(decoded_ds.split_descriptors().len(), 2);
     assert!(decoded_ds.local_runtime_factory().is_none());
     assert_eq!(
@@ -402,7 +402,7 @@ async fn test_split_descriptor_fast_field_schema_roundtrip() {
         Vec::new(),
         source_schema,
     );
-    let provider = SingleTableProvider::from_split_descriptors_with_fast_field_schema(
+    let provider = TantivyTableProvider::from_split_descriptors_with_fast_field_schema(
         vec![descriptor],
         canonical_schema,
     )
@@ -422,7 +422,7 @@ async fn test_split_descriptor_fast_field_schema_roundtrip() {
     let decoded = codec
         .try_decode(&buf, &[], &decode_session.state().task_ctx())
         .unwrap();
-    let decoded_descriptor = single_table_ds(&decoded).split_descriptors().remove(0);
+    let decoded_descriptor = tantivy_ds(&decoded).split_descriptors().remove(0);
     let decoded_schema = decoded_descriptor.fast_field_schema();
 
     assert_eq!(
@@ -449,7 +449,7 @@ async fn test_split_descriptor_without_fast_field_schema_roundtrip() {
         tantivy_schema,
         Vec::new(),
     );
-    let provider = SingleTableProvider::from_split_descriptors_with_fast_field_schema(
+    let provider = TantivyTableProvider::from_split_descriptors_with_fast_field_schema(
         vec![descriptor],
         canonical_schema,
     )
@@ -469,7 +469,7 @@ async fn test_split_descriptor_without_fast_field_schema_roundtrip() {
     let decoded = codec
         .try_decode(&buf, &[], &decode_session.state().task_ctx())
         .unwrap();
-    let decoded_descriptor = single_table_ds(&decoded).split_descriptors().remove(0);
+    let decoded_descriptor = tantivy_ds(&decoded).split_descriptors().remove(0);
 
     assert!(
         decoded_descriptor.fast_field_schema.is_none(),
@@ -478,9 +478,9 @@ async fn test_split_descriptor_without_fast_field_schema_roundtrip() {
 }
 
 #[tokio::test]
-async fn test_double_roundtrip_single_table() {
+async fn test_double_roundtrip_tantivy_table() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index.clone());
+    let provider = TantivyTableProvider::new(index.clone());
 
     let session = SessionContext::new();
     let state = session.state();
@@ -502,10 +502,10 @@ async fn test_double_roundtrip_single_table() {
     assert_eq!(buf1, buf2, "double roundtrip must produce identical bytes");
 }
 
-// ── AggDataSource roundtrip ───────────────────────────────────────
+// ── TantivyAggDataSource roundtrip ───────────────────────────────────────
 
 #[tokio::test]
-async fn test_agg_data_source_roundtrip() {
+async fn test_tantivy_agg_data_source_roundtrip() {
     let index = create_test_index();
 
     // Build a simple terms aggregation on "body" field.
@@ -521,7 +521,7 @@ async fn test_agg_data_source_roundtrip() {
         arrow::datatypes::Field::new("doc_count", arrow::datatypes::DataType::Int64, false),
     ]));
 
-    let agg_ds = AggDataSource::new(
+    let agg_ds = TantivyAggDataSource::new(
         index.clone(),
         Arc::new(aggs),
         output_schema.clone(),
@@ -555,7 +555,7 @@ async fn test_agg_data_source_roundtrip() {
 }
 
 #[tokio::test]
-async fn test_agg_data_source_with_query_roundtrip() {
+async fn test_tantivy_agg_data_source_with_query_roundtrip() {
     let index = create_test_index();
 
     // Build a terms aggregation with a FTS filter.
@@ -573,7 +573,7 @@ async fn test_agg_data_source_with_query_roundtrip() {
     // raw_queries simulates a full_text(body, 'rust') filter.
     let raw_queries = vec![("body".to_string(), "rust".to_string())];
 
-    let agg_ds = AggDataSource::new(
+    let agg_ds = TantivyAggDataSource::new(
         index.clone(),
         Arc::new(aggs),
         output_schema.clone(),
@@ -602,7 +602,7 @@ async fn test_agg_data_source_with_query_roundtrip() {
 }
 
 #[tokio::test]
-async fn test_multi_split_agg_data_source_roundtrip() {
+async fn test_multi_split_tantivy_agg_data_source_roundtrip() {
     let left = create_int_score_index(0);
     let right = create_float_score_index(100);
 
@@ -618,7 +618,7 @@ async fn test_multi_split_agg_data_source_roundtrip() {
     ]));
 
     let exec = Arc::new(DataSourceExec::new(Arc::new(
-        AggDataSource::from_local_splits(
+        TantivyAggDataSource::from_local_splits(
             vec![left.clone(), right.clone()],
             Arc::new(aggs),
             output_schema,
@@ -646,7 +646,7 @@ async fn test_multi_split_agg_data_source_roundtrip() {
 }
 
 #[tokio::test]
-async fn test_multi_split_partial_state_agg_data_source_roundtrip() {
+async fn test_multi_split_partial_state_tantivy_agg_data_source_roundtrip() {
     let left = create_int_score_index(0);
     let right = create_float_score_index(100);
 
@@ -666,7 +666,7 @@ async fn test_multi_split_partial_state_agg_data_source_roundtrip() {
     ]));
 
     let exec = Arc::new(DataSourceExec::new(Arc::new(
-        AggDataSource::from_local_splits_partial_states(
+        TantivyAggDataSource::from_local_splits_partial_states(
             vec![left.clone(), right.clone()],
             Arc::new(aggs),
             output_schema,
@@ -694,17 +694,18 @@ async fn test_multi_split_partial_state_agg_data_source_roundtrip() {
 }
 
 #[tokio::test]
-async fn test_multi_split_partial_state_agg_data_source_with_fast_field_filters_roundtrip() {
+async fn test_multi_split_partial_state_tantivy_agg_data_source_with_fast_field_filters_roundtrip()
+{
     let left = create_test_index();
     let right = create_test_index();
     let filter = col("price").gt(lit(2.0));
 
     let provider =
-        SingleTableProvider::from_local_splits(vec![left.clone(), right.clone()]).unwrap();
+        TantivyTableProvider::from_local_splits(vec![left.clone(), right.clone()]).unwrap();
     let session = SessionContext::new();
     let state = session.state();
     let scan_exec = provider.scan(&state, None, &[filter], None).await.unwrap();
-    let scan_ds = single_table_ds(&scan_exec);
+    let scan_ds = tantivy_ds(&scan_exec);
 
     let aggs: tantivy::aggregation::agg_req::Aggregations =
         serde_json::from_value(serde_json::json!({
@@ -718,7 +719,7 @@ async fn test_multi_split_partial_state_agg_data_source_with_fast_field_filters_
         arrow::datatypes::Field::new("doc_count", arrow::datatypes::DataType::Int64, false),
     ]));
     let exec = Arc::new(DataSourceExec::new(Arc::new(
-        AggDataSource::from_local_splits_partial_states(
+        TantivyAggDataSource::from_local_splits_partial_states(
             vec![left.clone(), right.clone()],
             Arc::new(aggs),
             output_schema,
@@ -749,7 +750,7 @@ async fn test_multi_split_partial_state_agg_data_source_with_fast_field_filters_
 #[tokio::test]
 async fn test_codec_roundtrip_with_fast_field_filters() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index.clone());
+    let provider = TantivyTableProvider::new(index.clone());
     let session = SessionContext::new();
     let state = session.state();
 
@@ -775,7 +776,7 @@ async fn test_codec_roundtrip_with_fast_field_filters() {
         let exec = provider.scan(&state, None, &[filter], None).await.unwrap();
         let decoded = roundtrip_exec(exec, index.clone());
         assert!(
-            single_table_ds(&decoded).pre_built_query().is_some(),
+            tantivy_ds(&decoded).pre_built_query().is_some(),
             "decoded plan should retain a tantivy fast-field query",
         );
     }
@@ -784,7 +785,7 @@ async fn test_codec_roundtrip_with_fast_field_filters() {
 #[tokio::test]
 async fn test_codec_roundtrip_fts_plus_fast_field_filter() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index.clone());
+    let provider = TantivyTableProvider::new(index.clone());
 
     let session = SessionContext::new();
     session.register_udf(full_text_udf());
@@ -800,7 +801,7 @@ async fn test_codec_roundtrip_fts_plus_fast_field_filter() {
 
     let exec = provider.scan(&state, None, &filters, None).await.unwrap();
     let decoded = roundtrip_exec(exec, index);
-    let decoded_ds = single_table_ds(&decoded);
+    let decoded_ds = tantivy_ds(&decoded);
 
     assert_eq!(
         decoded_ds.raw_queries(),
@@ -812,7 +813,7 @@ async fn test_codec_roundtrip_fts_plus_fast_field_filter() {
 #[tokio::test]
 async fn test_codec_roundtrip_agg_with_fast_field_filters() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index.clone());
+    let provider = TantivyTableProvider::new(index.clone());
     let session = SessionContext::new();
     let state = session.state();
 
@@ -826,7 +827,7 @@ async fn test_codec_roundtrip_agg_with_fast_field_filters() {
         .unwrap()
         .data_source()
         .as_any()
-        .downcast_ref::<SingleTableDataSource>()
+        .downcast_ref::<TantivyDataSource>()
         .unwrap();
 
     let aggs: tantivy::aggregation::agg_req::Aggregations =
@@ -838,7 +839,7 @@ async fn test_codec_roundtrip_agg_with_fast_field_filters() {
         arrow::datatypes::Field::new("category", arrow::datatypes::DataType::Utf8, false),
         arrow::datatypes::Field::new("doc_count", arrow::datatypes::DataType::Int64, false),
     ]));
-    let agg_exec = Arc::new(DataSourceExec::new(Arc::new(AggDataSource::new(
+    let agg_exec = Arc::new(DataSourceExec::new(Arc::new(TantivyAggDataSource::new(
         index.clone(),
         Arc::new(aggs),
         output_schema,
@@ -854,7 +855,7 @@ async fn test_codec_roundtrip_agg_with_fast_field_filters() {
 #[tokio::test]
 async fn test_codec_roundtrip_multi_valued_field_schema() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index.clone());
+    let provider = TantivyTableProvider::new(index.clone());
     let session = SessionContext::new();
     let state = session.state();
 
@@ -881,7 +882,7 @@ async fn test_codec_roundtrip_multi_valued_field_schema() {
 #[test]
 fn test_new_preserves_multi_valued_schema_for_local_index() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
     let schema = provider.schema();
     let field = schema.field(schema.index_of("tags").unwrap());
 
@@ -896,7 +897,7 @@ fn test_new_preserves_multi_valued_schema_for_local_index() {
 }
 
 #[tokio::test]
-async fn test_double_roundtrip_agg_data_source() {
+async fn test_double_roundtrip_tantivy_agg_data_source() {
     let index = create_test_index();
     let aggs: tantivy::aggregation::agg_req::Aggregations =
         serde_json::from_value(serde_json::json!({
@@ -907,7 +908,7 @@ async fn test_double_roundtrip_agg_data_source() {
         arrow::datatypes::Field::new("category", DataType::Utf8, false),
         arrow::datatypes::Field::new("doc_count", DataType::Int64, false),
     ]));
-    let exec = Arc::new(DataSourceExec::new(Arc::new(AggDataSource::new(
+    let exec = Arc::new(DataSourceExec::new(Arc::new(TantivyAggDataSource::new(
         index.clone(),
         Arc::new(aggs),
         output_schema,

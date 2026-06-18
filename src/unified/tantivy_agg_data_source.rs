@@ -1,7 +1,7 @@
 /// A DataSource that runs tantivy's native aggregation on query-filtered docs.
 ///
 /// Created by the `AggPushdown` optimizer rule when it detects an
-/// `AggregateExec` above a `SingleTableDataSource`. Preserves the full
+/// `AggregateExec` above a `TantivyDataSource`. Preserves the full
 /// query context (FTS + fast field filters) from the original scan.
 use std::any::Any;
 use std::fmt;
@@ -31,7 +31,7 @@ use crate::index_opener::{IndexOpener, OpenerSplitRuntimeFactory};
 use crate::split_runtime::{
     PreparedSplit, SplitDescriptor, SplitRuntimeFactoryExt, SplitRuntimeFactoryRef,
 };
-use crate::unified::single_table_provider::build_split_fast_field_query;
+use crate::unified::tantivy_table_provider::build_split_fast_field_query;
 use crate::util::build_combined_query;
 
 /// Guard that calls `BaselineMetrics::done()` on drop so elapsed time is
@@ -62,7 +62,7 @@ struct AggSplitPlan {
     needs_warmup: bool,
 }
 
-pub struct AggDataSource {
+pub struct TantivyAggDataSource {
     splits: Vec<AggSplitPlan>,
     /// Tantivy aggregation specification (terms + metric sub-aggs).
     aggregations: Arc<Aggregations>,
@@ -85,9 +85,9 @@ pub struct AggDataSource {
     metrics: ExecutionPlanMetricsSet,
 }
 
-impl fmt::Debug for AggDataSource {
+impl fmt::Debug for TantivyAggDataSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AggDataSource")
+        f.debug_struct("TantivyAggDataSource")
             .field("splits", &self.splits.len())
             .field("output_mode", &self.output_mode)
             .field("schema", &self.output_schema)
@@ -169,7 +169,7 @@ fn empty_batch_stream(schema: SchemaRef) -> SendableRecordBatchStream {
     Box::pin(RecordBatchStreamAdapter::new(schema, stream::empty()))
 }
 
-impl AggDataSource {
+impl TantivyAggDataSource {
     pub fn new(
         index: tantivy::Index,
         aggregations: Arc<Aggregations>,
@@ -454,7 +454,7 @@ impl AggDataSource {
     }
 }
 
-impl DataSource for AggDataSource {
+impl DataSource for TantivyAggDataSource {
     fn open(
         &self,
         partition: usize,
@@ -572,7 +572,7 @@ impl DataSource for AggDataSource {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "AggDataSource(mode={:?}, aggs={}, splits={}, query={})",
+            "TantivyAggDataSource(mode={:?}, aggs={}, splits={}, query={})",
             self.output_mode,
             self.aggregations.len(),
             self.splits.len(),
@@ -652,12 +652,11 @@ async fn execute_final_agg_batch(
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
 
     if splits.len() == 1 {
-        let split = splits
-            .into_iter()
-            .next()
-            .ok_or_else(|| DataFusionError::Internal("AggDataSource missing split".into()))?;
+        let split = splits.into_iter().next().ok_or_else(|| {
+            DataFusionError::Internal("TantivyAggDataSource missing split".into())
+        })?;
         let warmup_done = warmup_done.into_iter().next().ok_or_else(|| {
-            DataFusionError::Internal("AggDataSource missing warmup state".into())
+            DataFusionError::Internal("TantivyAggDataSource missing warmup state".into())
         })?;
         let batch = execute_single_split_agg_batch(
             split,

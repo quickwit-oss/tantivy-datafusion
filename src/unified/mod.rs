@@ -1,9 +1,9 @@
-//! **Unified single-table approach** (recommended for BYOC).
+//! **Unified Tantivy table approach** (recommended for BYOC).
 //!
 //! A single `DataSource` that handles FTS queries, fast field reading, scoring,
 //! document retrieval, and aggregations internally — no joins needed.
 //!
-//! Start reviewing here: [`single_table_provider::SingleTableProvider`] is the
+//! Start reviewing here: [`tantivy_table_provider::TantivyTableProvider`] is the
 //! entry point.
 //!
 //! ## Rule Ordering
@@ -12,8 +12,8 @@
 //! optimizer rules. Tantivy aggregation pushdown must see the local
 //! `AggregateExec` subtree before network boundaries are inserted.
 
-pub mod agg_data_source;
 pub(crate) mod agg_exec;
 pub mod agg_pushdown;
 pub(crate) mod plan_traversal;
-pub mod single_table_provider;
+pub mod tantivy_agg_data_source;
+pub mod tantivy_table_provider;

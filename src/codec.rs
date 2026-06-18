@@ -16,11 +16,11 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use prost::Message;
 
 use crate::split_runtime::SplitDescriptor;
-use crate::unified::agg_data_source::{AggDataSource, AggOutputMode};
-use crate::unified::single_table_provider::{
+use crate::unified::tantivy_agg_data_source::{AggOutputMode, TantivyAggDataSource};
+use crate::unified::tantivy_table_provider::{
     deserialize_fast_field_filter_exprs, deserialize_fast_field_filters,
-    serialize_fast_field_filters, PartitionSpec, ScanSchema, SingleTableCodecFields,
-    SingleTableDataSource, SplitExecutionPlan,
+    serialize_fast_field_filters, PartitionSpec, ScanSchema, SplitExecutionPlan,
+    TantivyCodecFields, TantivyDataSource,
 };
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -39,7 +39,7 @@ struct SplitDescriptorProto {
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct TantivyPlanProto {
-    /// 3 = `SINGLE_TABLE`, 4 = `AGG_DATA_SOURCE`.
+    /// 3 = `TANTIVY_DATA_SOURCE`, 4 = `TANTIVY_AGG_DATA_SOURCE`.
     #[prost(uint32, tag = "1")]
     provider_type: u32,
     #[prost(uint32, repeated, tag = "2")]
@@ -75,8 +75,8 @@ struct TantivyPlanProto {
     raw_not_queries_json: String,
 }
 
-const SINGLE_TABLE: u32 = 3;
-const AGG_DATA_SOURCE: u32 = 4;
+const TANTIVY_DATA_SOURCE: u32 = 3;
+const TANTIVY_AGG_DATA_SOURCE: u32 = 4;
 const AGG_OUTPUT_FINAL_MERGED: u32 = 0;
 const AGG_OUTPUT_PARTIAL_STATES: u32 = 1;
 
@@ -165,7 +165,7 @@ fn reconstruct_pre_built_query(
     }
 }
 
-fn build_single_table_scan_schema(
+fn build_tantivy_table_scan_schema(
     canonical_ff_schema: &SchemaRef,
     projection: Option<&[usize]>,
 ) -> Result<ScanSchema> {
@@ -246,7 +246,7 @@ fn build_single_table_scan_schema(
     })
 }
 
-fn encode_single_table_plan(st: &SingleTableDataSource) -> Result<TantivyPlanProto> {
+fn encode_tantivy_table_plan(st: &TantivyDataSource) -> Result<TantivyPlanProto> {
     let split_descriptors = st
         .split_descriptor_refs()
         .map(encode_split_descriptor)
@@ -279,7 +279,7 @@ fn encode_single_table_plan(st: &SingleTableDataSource) -> Result<TantivyPlanPro
     };
 
     Ok(TantivyPlanProto {
-        provider_type: SINGLE_TABLE,
+        provider_type: TANTIVY_DATA_SOURCE,
         projection,
         has_projection,
         raw_queries_json,
@@ -298,7 +298,7 @@ fn encode_single_table_plan(st: &SingleTableDataSource) -> Result<TantivyPlanPro
     })
 }
 
-fn encode_agg_plan(agg_ds: &AggDataSource) -> Result<TantivyPlanProto> {
+fn encode_agg_plan(agg_ds: &TantivyAggDataSource) -> Result<TantivyPlanProto> {
     let split_descriptors = agg_ds
         .split_descriptor_refs()
         .map(encode_split_descriptor)
@@ -315,7 +315,7 @@ fn encode_agg_plan(agg_ds: &AggDataSource) -> Result<TantivyPlanProto> {
     };
 
     Ok(TantivyPlanProto {
-        provider_type: AGG_DATA_SOURCE,
+        provider_type: TANTIVY_AGG_DATA_SOURCE,
         projection: Vec::new(),
         has_projection: false,
         raw_queries_json,
@@ -350,11 +350,11 @@ impl PhysicalExtensionCodec for TantivyCodec {
             })?;
         let ds = ds_exec.data_source();
 
-        if let Some(st) = ds.as_any().downcast_ref::<SingleTableDataSource>() {
-            return encode_plan_proto(encode_single_table_plan(st)?, buf);
+        if let Some(st) = ds.as_any().downcast_ref::<TantivyDataSource>() {
+            return encode_plan_proto(encode_tantivy_table_plan(st)?, buf);
         }
 
-        if let Some(agg_ds) = ds.as_any().downcast_ref::<AggDataSource>() {
+        if let Some(agg_ds) = ds.as_any().downcast_ref::<TantivyAggDataSource>() {
             return encode_plan_proto(encode_agg_plan(agg_ds)?, buf);
         }
 
@@ -391,8 +391,8 @@ impl PhysicalExtensionCodec for TantivyCodec {
         };
 
         match proto.provider_type {
-            SINGLE_TABLE => decode_single_table(&proto, projection.as_deref()),
-            AGG_DATA_SOURCE => decode_agg(&proto),
+            TANTIVY_DATA_SOURCE => decode_tantivy_table(&proto, projection.as_deref()),
+            TANTIVY_AGG_DATA_SOURCE => decode_agg(&proto),
             other => Err(DataFusionError::Internal(format!(
                 "unknown tantivy provider type: {other}"
             ))),
@@ -400,17 +400,17 @@ impl PhysicalExtensionCodec for TantivyCodec {
     }
 }
 
-fn decode_single_table(
+fn decode_tantivy_table(
     proto: &TantivyPlanProto,
     projection: Option<&[usize]>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     if proto.canonical_ff_schema_bytes.is_empty() {
         return Err(DataFusionError::Internal(
-            "missing canonical fast field schema for SINGLE_TABLE".into(),
+            "missing canonical fast field schema for TANTIVY_DATA_SOURCE".into(),
         ));
     }
     let canonical_ff_schema = decode_schema_bytes(&proto.canonical_ff_schema_bytes)?;
-    let scan_schema = build_single_table_scan_schema(&canonical_ff_schema, projection)?;
+    let scan_schema = build_tantivy_table_scan_schema(&canonical_ff_schema, projection)?;
     let raw_queries: Vec<(String, String)> = if proto.raw_queries_json.is_empty() {
         Vec::new()
     } else {
@@ -458,7 +458,7 @@ fn decode_single_table(
         None
     };
 
-    let ds = SingleTableDataSource::new_from_codec(SingleTableCodecFields {
+    let ds = TantivyDataSource::new_from_codec(TantivyCodecFields {
         splits,
         schema: scan_schema,
         raw_queries,
@@ -477,7 +477,7 @@ fn decode_agg(proto: &TantivyPlanProto) -> Result<Arc<dyn ExecutionPlan>> {
         .map_err(|e| DataFusionError::Internal(format!("parse aggregations: {e}")))?;
     if proto.output_schema_bytes.is_empty() {
         return Err(DataFusionError::Internal(
-            "missing output schema for AGG_DATA_SOURCE".into(),
+            "missing output schema for TANTIVY_AGG_DATA_SOURCE".into(),
         ));
     }
     let output_schema = decode_schema_bytes(&proto.output_schema_bytes)?;
@@ -505,7 +505,7 @@ fn decode_agg(proto: &TantivyPlanProto) -> Result<Arc<dyn ExecutionPlan>> {
 
     let aggregations = Arc::new(aggregations);
     let ds = match proto.agg_output_mode {
-        AGG_OUTPUT_PARTIAL_STATES => AggDataSource::from_split_descriptors_partial_states(
+        AGG_OUTPUT_PARTIAL_STATES => TantivyAggDataSource::from_split_descriptors_partial_states(
             split_descriptors,
             aggregations,
             output_schema,
@@ -513,7 +513,7 @@ fn decode_agg(proto: &TantivyPlanProto) -> Result<Arc<dyn ExecutionPlan>> {
             pre_built_query,
             fast_field_filter_exprs,
         ),
-        _ => AggDataSource::from_split_descriptors(
+        _ => TantivyAggDataSource::from_split_descriptors(
             split_descriptors,
             aggregations,
             output_schema,

@@ -88,10 +88,10 @@ emission from within the callback is feasible with no borrow conflicts.
 Prompt to address this:
 
 ▌ You are refactoring collect_matching_docs in src/util.rs and
-▌ generate_single_table_batch_streaming in src/unified/single_table_provider.rs.
+▌ generate_tantivy_table_batch_streaming in src/unified/tantivy_table_provider.rs.
 ▌ Currently, collect_matching_docs returns (Vec<u32>, Option<Vec<f32>>), materializing all
 ▌ matching doc_ids for an entire segment before the batching loop in
-▌ generate_single_table_batch_streaming (line 1035-1042) chunks them.
+▌ generate_tantivy_table_batch_streaming (line 1035-1042) chunks them.
 ▌ Goal: Bound memory to O(batch_size) instead of O(segment) for all non-TopK paths.
 ▌ Approach: Replace collect_matching_docs with two functions:
 ▌  1 collect_topk_docs(...) — keep the existing TopK path (lines 72-110), already bounded
@@ -120,7 +120,7 @@ Prompt to address this:
 ▌    weight.for_each(segment_reader, &mut |doc, score| { ... }).
 ▌  • No-query path: iterate (0..max_doc) with alive_bitset filtering, emitting every
 ▌    batch_size docs. No tantivy callback involved — straightforward loop.
-▌ In generate_single_table_batch_streaming, wire the streaming function directly to
+▌ In generate_tantivy_table_batch_streaming, wire the streaming function directly to
 ▌ ChunkBuilder:
 ▌
 ▌  for_each_matching_doc_chunks(
@@ -135,14 +135,14 @@ Prompt to address this:
 ▌ Do NOT add a crossbeam channel — the existing tokio::sync::mpsc::channel(2) at line 640
 ▌ already provides the blocking-to-async bridge and backpressure. Do NOT modify the TopK
 ▌ path.
-▌ Files to modify: src/util.rs, src/unified/single_table_provider.rs
+▌ Files to modify: src/util.rs, src/unified/tantivy_table_provider.rs
 ▌ Memory profile after: ~64KB per partition (batch_size=8192) instead of ~80MB for 10M
 ▌ matches — a 1250x reduction.
 
 ---------------------------------------------------------------------------------------------
 
 4. Fast field filter codec path is completely untested — silent filter loss on workers —
-src/unified/single_table_provider.rs:1316-1401
+src/unified/tantivy_table_provider.rs:1316-1401
 
 The codec serializes fast field filters as JSON via serialize_fast_field_filters() /
 deserialize_fast_field_filters(). Zero codec roundtrip tests exercise this path. If
@@ -160,7 +160,7 @@ Fix: Add codec roundtrip tests:
 
  #[tokio::test]
  async fn test_codec_roundtrip_with_fast_field_filters() {
-     // 1. Create SingleTableDataSource with a numeric fast field filter
+     // 1. Create TantivyDataSource with a numeric fast field filter
      //    (e.g., price > 2.0 as Expr::BinaryExpr)
      // 2. Round-trip through the codec
      // 3. Assert the decoded plan's pre_built_query is Some, not None
@@ -174,7 +174,7 @@ Fix: Add codec roundtrip tests:
 
  #[tokio::test]
  async fn test_codec_roundtrip_agg_with_fast_field_filters() {
-     // AggDataSource with fast field filters
+     // TantivyAggDataSource with fast field filters
  }
 
 
@@ -183,7 +183,7 @@ Fix: Add codec roundtrip tests:
 Medium Findings
 
 5. Timestamp timezone dropped in codec serialization —
-src/unified/single_table_provider.rs:1425-1428
+src/unified/tantivy_table_provider.rs:1425-1428
 
 scalar_to_json_pair discards the timezone from all Timestamp variants (the _ in
 TimestampMicrosecond(Some(v), _)). On deserialization, json_pair_to_scalar always
@@ -218,7 +218,7 @@ Apply the same pattern for ts_s, ts_ms, ts_ns.
 ---------------------------------------------------------------------------------------------
 
 6. eq_properties() does not declare output ordering —
-src/unified/single_table_provider.rs:779-781
+src/unified/tantivy_table_provider.rs:779-781
 
 Returns bare EquivalenceProperties with no ordering. When no TopK is active, docs are emitted
 in doc_id order within each segment. Declaring _doc_id ASC lets the optimizer skip redundant
@@ -323,7 +323,7 @@ Architectural Findings
 behavior — src/unified/agg_pushdown.rs:124-159
 
 AggPushdown rewrites AggregateExec(Final) → ... → AggregateExec(Partial) → DataSourceExec
-into a single DataSourceExec(AggDataSource) with 1 partition. When this rule runs before a
+into a single DataSourceExec(TantivyAggDataSource) with 1 partition. When this rule runs before a
 distributed physical optimizer, the aggregation is collapsed before the distributed planner
 inserts network boundaries. When reversed, the distributed planner inserts
 NetworkCoalesceExec which AggPushdown can't see through, so it doesn't fire.
@@ -349,7 +349,7 @@ Prompt to address this:
 ---------------------------------------------------------------------------------------------
 
 11. No schema reconciliation layer between tantivy types and downstream consumers —
-src/schema_mapping.rs, src/unified/single_table_provider.rs
+src/schema_mapping.rs, src/unified/tantivy_table_provider.rs
 
 SpiceAI uses SchemaCastScanExec as a wrapper that handles nullability adjustments, type
 coercion, and column stripping between the source and downstream consumers.
@@ -358,7 +358,7 @@ what downstream consumers expect would surface as runtime errors.
 
 Prompt to address this:
 
-▌ You are evaluating whether SingleTableDataSource needs a schema reconciliation layer,
+▌ You are evaluating whether TantivyDataSource needs a schema reconciliation layer,
 ▌ inspired by SpiceAI's SchemaCastScanExec.
 ▌ Currently tantivy-datafusion trusts that tantivy_schema_to_arrow produces a schema
 ▌ compatible with all downstream consumers. Consider adding a lightweight SchemaCastExec
@@ -370,7 +370,7 @@ Prompt to address this:
 ▌ mismatches are sufficient or whether silent type coercion issues exist.
 ▌ Reference: SpiceAI's SchemaCastScanExec at
 ▌ crates/runtime-datafusion/src/execution_plan/schema_cast.rs
-▌ Files to consider: src/unified/single_table_provider.rs (the open() method), new file
+▌ Files to consider: src/unified/tantivy_table_provider.rs (the open() method), new file
 ▌ src/schema_cast.rs
 
 ---------------------------------------------------------------------------------------------
@@ -390,9 +390,9 @@ Low / Info
    None from scalar_arrow_type, so they don't appear in the Arrow schema. Defensible
    simplification, but a tracing::warn! for unrecognized field types would help users who
    expect these fields to appear.
- • No double-roundtrip test for AggDataSource codec (tests/codec_roundtrip.rs):
-   SingleTableDataSource has one but AggDataSource does not.
- • Score .to_vec() per batch (single_table_provider.rs:934): Float32Array::from(sc.to_vec())
+ • No double-roundtrip test for TantivyAggDataSource codec (tests/codec_roundtrip.rs):
+   TantivyDataSource has one but TantivyAggDataSource does not.
+ • Score .to_vec() per batch (tantivy_table_provider.rs:934): Float32Array::from(sc.to_vec())
    copies the score slice. This is O(batch_size) and acceptable in isolation, but becomes
    redundant after the streaming refactor from finding #3 (scores can be fed directly into
    the builder).

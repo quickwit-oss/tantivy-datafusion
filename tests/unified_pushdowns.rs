@@ -7,10 +7,10 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::*;
 use tantivy::schema::{Field, SchemaBuilder, FAST, STORED, TEXT};
 use tantivy::{DateTime, Index, IndexWriter, TantivyDocument};
-use tantivy_datafusion::{full_text_udf, AggPushdown, SingleTableProvider};
+use tantivy_datafusion::{full_text_udf, AggPushdown, TantivyTableProvider};
 
 // ---------------------------------------------------------------------------
-// Shared helpers (mirrored from single_table.rs / end_to_end.rs)
+// Shared helpers (mirrored from tantivy_table.rs / end_to_end.rs)
 // ---------------------------------------------------------------------------
 
 fn build_test_schema() -> (
@@ -120,9 +120,9 @@ fn plan_to_string(batches: &[RecordBatch]) -> String {
 }
 
 /// Create a session context with the unified optimizer rules and the
-/// SingleTableProvider registered as table "t".
+/// TantivyTableProvider registered as table "t".
 fn setup_ctx(index: Index) -> SessionContext {
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
     let config = SessionConfig::new().with_target_partitions(1);
     let state = SessionStateBuilder::new()
         .with_config(config)
@@ -136,7 +136,7 @@ fn setup_ctx(index: Index) -> SessionContext {
 }
 
 fn setup_multi_split_ctx(indices: Vec<Index>) -> SessionContext {
-    let provider = SingleTableProvider::from_local_splits(indices).unwrap();
+    let provider = TantivyTableProvider::from_local_splits(indices).unwrap();
     let config = SessionConfig::new().with_target_partitions(4);
     let state = SessionStateBuilder::new()
         .with_config(config)
@@ -339,8 +339,8 @@ async fn test_multi_split_agg_pushdown_group_by_count() {
     let explain_batches = explain.collect().await.unwrap();
     let plan = plan_to_string(&explain_batches);
     assert!(
-        plan.contains("AggDataSource"),
-        "Multi-split group by count should push down to AggDataSource.\n\nPlan:\n{plan}"
+        plan.contains("TantivyAggDataSource"),
+        "Multi-split group by count should push down to TantivyAggDataSource.\n\nPlan:\n{plan}"
     );
     assert!(
         plan.contains("AggregateExec"),
@@ -425,8 +425,8 @@ async fn test_multi_split_agg_pushdown_group_by_sum_avg() {
     let explain_batches = explain.collect().await.unwrap();
     let plan = plan_to_string(&explain_batches);
     assert!(
-        plan.contains("AggDataSource"),
-        "Multi-split sum/avg should push down partial states to AggDataSource.\n\nPlan:\n{plan}"
+        plan.contains("TantivyAggDataSource"),
+        "Multi-split sum/avg should push down partial states to TantivyAggDataSource.\n\nPlan:\n{plan}"
     );
     assert!(
         plan.contains("AggregateExec"),
@@ -461,7 +461,7 @@ async fn test_multi_split_agg_pushdown_skips_missing_group_field() {
     let explain_batches = explain.collect().await.unwrap();
     let plan = plan_to_string(&explain_batches);
     assert!(
-        !plan.contains("AggDataSource"),
+        !plan.contains("TantivyAggDataSource"),
         "Schema-drifted group field must not be pushed down.\n\nPlan:\n{plan}"
     );
     assert!(
@@ -637,7 +637,7 @@ async fn test_agg_empty_result() {
 #[tokio::test]
 async fn test_plan_has_no_joins() {
     // EXPLAIN SELECT category, COUNT(*) FROM t GROUP BY category
-    // Verify no HashJoinExec; should use SingleTableDataSource or AggDataSource
+    // Verify no HashJoinExec; should use TantivyDataSource or TantivyAggDataSource
     let ctx = setup_ctx(create_test_index());
 
     let df = ctx
@@ -652,8 +652,8 @@ async fn test_plan_has_no_joins() {
         "Plan should not contain HashJoinExec.\n\nPlan:\n{plan}"
     );
     // Should contain one of our custom data sources
-    let has_custom_ds = plan.contains("SingleTableDataSource")
-        || plan.contains("AggDataSource")
+    let has_custom_ds = plan.contains("TantivyDataSource")
+        || plan.contains("TantivyAggDataSource")
         || plan.contains("TantivyAggregateExec")
         || plan.contains("DenseOrdinalAggExec");
     assert!(
@@ -663,7 +663,7 @@ async fn test_plan_has_no_joins() {
 }
 
 #[tokio::test]
-async fn test_plan_uses_agg_data_source_for_group_by_count() {
+async fn test_plan_uses_tantivy_agg_data_source_for_group_by_count() {
     let ctx = setup_ctx(create_test_index());
 
     let df = ctx
@@ -674,8 +674,8 @@ async fn test_plan_uses_agg_data_source_for_group_by_count() {
     let plan = plan_to_string(&batches);
 
     assert!(
-        plan.contains("AggDataSource"),
-        "Plan should use AggDataSource for GROUP BY count pushdown.\n\nPlan:\n{plan}"
+        plan.contains("TantivyAggDataSource"),
+        "Plan should use TantivyAggDataSource for GROUP BY count pushdown.\n\nPlan:\n{plan}"
     );
     assert!(
         !plan.contains("AggregateExec"),
@@ -713,7 +713,7 @@ async fn test_agg_pushdown_skips_filter_aggregates() {
     let plan = plan_to_string(&explain_batches);
 
     assert!(
-        !plan.contains("AggDataSource"),
+        !plan.contains("TantivyAggDataSource"),
         "FILTER aggregates must not be pushed down.\n\nPlan:\n{plan}"
     );
     assert!(
@@ -752,7 +752,7 @@ async fn test_agg_pushdown_skips_distinct_aggregates() {
     let plan = plan_to_string(&explain_batches);
 
     assert!(
-        !plan.contains("AggDataSource"),
+        !plan.contains("TantivyAggDataSource"),
         "DISTINCT aggregates must not be pushed down.\n\nPlan:\n{plan}"
     );
     assert!(

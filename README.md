@@ -13,7 +13,7 @@ change as the Quickwit integration settles.
 
 ## What It Provides
 
-- A `SingleTableProvider` that presents one or more Tantivy indexes as a single
+- A `TantivyTableProvider` that presents one or more Tantivy indexes as a single
   DataFusion table.
 - SQL projection and filtering over Tantivy fast fields.
 - A `full_text(column, query)` SQL UDF that pushes Tantivy query parsing and
@@ -46,13 +46,13 @@ use std::sync::Arc;
 
 use datafusion::prelude::*;
 use tantivy::Index;
-use tantivy_datafusion::{full_text_udf, SingleTableProvider};
+use tantivy_datafusion::{full_text_udf, TantivyTableProvider};
 
 async fn query_index(index: Index) -> datafusion::common::Result<()> {
     let ctx = SessionContext::new();
 
     ctx.register_udf(full_text_udf());
-    ctx.register_table("docs", Arc::new(SingleTableProvider::new(index)))?;
+    ctx.register_table("docs", Arc::new(TantivyTableProvider::new(index)))?;
 
     let batches = ctx
         .sql(
@@ -81,7 +81,7 @@ use std::sync::Arc;
 
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::*;
-use tantivy_datafusion::{full_text_udf, AggPushdown, SingleTableProvider};
+use tantivy_datafusion::{full_text_udf, AggPushdown, TantivyTableProvider};
 
 let state = SessionStateBuilder::new()
     .with_config(SessionConfig::new())
@@ -91,7 +91,7 @@ let state = SessionStateBuilder::new()
 
 let ctx = SessionContext::new_with_state(state);
 ctx.register_udf(full_text_udf());
-ctx.register_table("docs", Arc::new(SingleTableProvider::new(index)))?;
+ctx.register_table("docs", Arc::new(TantivyTableProvider::new(index)))?;
 ```
 
 Supported pushdowns include common grouped and ungrouped aggregations that can be
@@ -103,7 +103,7 @@ back to normal DataFusion execution.
 For local multi-index execution, use:
 
 ```rust
-let provider = SingleTableProvider::from_local_splits(indexes)?;
+let provider = TantivyTableProvider::from_local_splits(indexes)?;
 ctx.register_table("docs", Arc::new(provider))?;
 ```
 

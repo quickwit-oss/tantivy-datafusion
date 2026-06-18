@@ -10,7 +10,7 @@ root-level OSS presentation to keep the project focused.
 
 Relevant notes:
 
-- `multi-split.md`: multi-split `SingleTableProvider` design for Quickwit-style
+- `multi-split.md`: multi-split `TantivyTableProvider` design for Quickwit-style
   execution.
 - `runtime-alignment.md`: runtime alignment notes for sync Tantivy work inside
   async systems.

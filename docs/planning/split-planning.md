@@ -231,7 +231,7 @@ The intended mapping from Quickwit to DataFusion is:
 
 ## Scan Execution Flow
 
-For a `SingleTableDataSource` partition:
+For a `TantivyDataSource` partition:
 
 1. Decode plan and obtain the split descriptor for this partition.
 2. Call `prepare_split(split).await`.
@@ -363,7 +363,7 @@ The Quickwit side should:
 1. Resolve index metadata without opening splits.
 2. List published splits from the metastore.
 3. Convert `SplitMetadata` into `SplitDescriptor`.
-4. Construct a `SingleTableProvider` or `AggDataSource` from split
+4. Construct a `TantivyTableProvider` or `TantivyAggDataSource` from split
    descriptors.
 5. Register a `SplitRuntimeFactory` on the session config for workers.
 
@@ -380,8 +380,8 @@ The Tantivy side should:
 1. Introduce `SplitDescriptor`.
 2. Introduce `PreparedSplit`.
 3. Introduce `SplitRuntimeFactory`.
-4. Refactor `SingleTableDataSource` to partition by split.
-5. Refactor `AggDataSource` to operate on prepared splits.
+4. Refactor `TantivyDataSource` to partition by split.
+5. Refactor `TantivyAggDataSource` to operate on prepared splits.
 6. Refactor warmup helpers to be `Searcher`-based.
 7. Refactor `_document` fill to use shared prepared split searchers.
 8. Remove planner-time dependence on sync opener metadata for distributed use.
@@ -405,13 +405,13 @@ The Tantivy side should:
 
 ### Scan
 
-- current `SingleTableProvider::from_splits(openers)` -> target
-  `SingleTableProvider::from_split_descriptors(descriptors, canonical_schema)`
+- current `TantivyTableProvider::from_splits(openers)` -> target
+  `TantivyTableProvider::from_split_descriptors(descriptors, canonical_schema)`
 
 ### Aggregation
 
-- current `AggDataSource::from_split_openers(...)` -> target
-  `AggDataSource::from_split_descriptors(...)`
+- current `TantivyAggDataSource::from_split_openers(...)` -> target
+  `TantivyAggDataSource::from_split_descriptors(...)`
 
 ## Recommended Implementation Order
 

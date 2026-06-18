@@ -6,7 +6,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use tantivy::schema::{SchemaBuilder, FAST, STORED, STRING, TEXT};
 use tantivy::{Index, IndexWriter, TantivyDocument};
-use tantivy_datafusion::{full_text_udf, SingleTableProvider};
+use tantivy_datafusion::{full_text_udf, TantivyTableProvider};
 
 fn collect_batches(batches: &[RecordBatch]) -> RecordBatch {
     arrow::compute::concat_batches(&batches[0].schema(), batches).unwrap()
@@ -148,7 +148,7 @@ async fn test_multi_split_explicit_schema_casts_and_null_pads() {
         Field::new("active", DataType::Boolean, true),
     ]));
 
-    let provider = SingleTableProvider::from_local_splits_with_fast_field_schema(
+    let provider = TantivyTableProvider::from_local_splits_with_fast_field_schema(
         vec![split_a, split_b],
         canonical_schema,
     )
@@ -193,7 +193,7 @@ async fn test_multi_split_missing_field_filter_returns_only_matching_split_rows(
         Field::new("active", DataType::Boolean, true),
     ]));
 
-    let provider = SingleTableProvider::from_local_splits_with_fast_field_schema(
+    let provider = TantivyTableProvider::from_local_splits_with_fast_field_schema(
         vec![split_a, split_b],
         canonical_schema,
     )
@@ -215,7 +215,7 @@ async fn test_multi_split_scalar_to_list_promotion() {
     let split_a = create_scalar_tags_split();
     let split_b = create_list_tags_split();
 
-    let provider = SingleTableProvider::from_local_splits(vec![split_a, split_b]).unwrap();
+    let provider = TantivyTableProvider::from_local_splits(vec![split_a, split_b]).unwrap();
 
     let config = SessionConfig::new().with_target_partitions(4);
     let ctx = SessionContext::new_with_config(config);
@@ -249,7 +249,7 @@ async fn test_multi_split_full_text_ignores_splits_missing_field() {
     let split_a = create_category_split();
     let split_b = create_missing_score_split();
 
-    let provider = SingleTableProvider::from_local_splits(vec![split_a, split_b]).unwrap();
+    let provider = TantivyTableProvider::from_local_splits(vec![split_a, split_b]).unwrap();
 
     let config = SessionConfig::new().with_target_partitions(4);
     let ctx = SessionContext::new_with_config(config);
@@ -270,7 +270,7 @@ async fn test_multi_split_full_text_ignores_splits_missing_field() {
 #[tokio::test]
 async fn test_multi_split_full_text_all_missing_field_matches_zero_rows() {
     let provider =
-        SingleTableProvider::from_local_splits(vec![create_missing_score_split()]).unwrap();
+        TantivyTableProvider::from_local_splits(vec![create_missing_score_split()]).unwrap();
 
     let config = SessionConfig::new().with_target_partitions(4);
     let ctx = SessionContext::new_with_config(config);
@@ -290,7 +290,7 @@ async fn test_multi_split_full_text_all_missing_field_matches_zero_rows() {
 #[tokio::test]
 async fn test_multi_split_full_text_or_group_all_missing_fields_matches_zero_rows() {
     let provider =
-        SingleTableProvider::from_local_splits(vec![create_missing_score_split()]).unwrap();
+        TantivyTableProvider::from_local_splits(vec![create_missing_score_split()]).unwrap();
 
     let config = SessionConfig::new().with_target_partitions(4);
     let ctx = SessionContext::new_with_config(config);
@@ -335,7 +335,7 @@ async fn test_multi_split_partition_count_matches_split_count() {
     writer_b.add_document(third).unwrap();
     writer_b.commit().unwrap();
 
-    let provider = SingleTableProvider::from_local_splits(vec![split_a, split_b]).unwrap();
+    let provider = TantivyTableProvider::from_local_splits(vec![split_a, split_b]).unwrap();
 
     let ctx = SessionContext::new();
     let state = ctx.state();

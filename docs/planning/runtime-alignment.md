@@ -62,8 +62,8 @@ Still misaligned:
 
 Relevant code:
 
-- `src/unified/single_table_provider.rs`
-- `src/unified/agg_data_source.rs`
+- `src/unified/tantivy_table_provider.rs`
+- `src/unified/tantivy_agg_data_source.rs`
 - `src/warmup.rs`
 
 ## What `dd-datafusion` Does
@@ -222,7 +222,7 @@ Acceptance:
 
 Files:
 
-- `src/unified/single_table_provider.rs`
+- `src/unified/tantivy_table_provider.rs`
 
 Work:
 
@@ -239,7 +239,7 @@ Acceptance:
 
 Files:
 
-- `src/unified/agg_data_source.rs`
+- `src/unified/tantivy_agg_data_source.rs`
 
 Work:
 

@@ -9,5 +9,5 @@
 9. `derive_tantivy_aggregations` silently drops unsupported aggregation families** — agg derivation module
 
 
-- `AggDataSource` has six constructors — collapse into one + builder when doing Finding 3.
+- `TantivyAggDataSource` has six constructors — collapse into one + builder when doing Finding 3.
 - The crate already has `MetricsGuard` and `AbortOnDrop` patterns in place — the foundations for proper metrics and task lifecycle are there; they just need to be lifted into a shared core (Finding 3) rather than copy-pasted.

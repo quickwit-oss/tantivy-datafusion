@@ -6,7 +6,7 @@ use arrow::datatypes::{Float64Type, UInt64Type};
 use datafusion::prelude::*;
 use tantivy::schema::{Field, SchemaBuilder, FAST, STORED, TEXT};
 use tantivy::{DateTime, Index, IndexWriter, TantivyDocument};
-use tantivy_datafusion::{full_text_udf, SingleTableProvider};
+use tantivy_datafusion::{full_text_udf, TantivyTableProvider};
 
 // ---------------------------------------------------------------------------
 // Shared helpers (mirrored from end_to_end.rs)
@@ -125,7 +125,7 @@ fn collect_batches(batches: &[RecordBatch]) -> RecordBatch {
 #[tokio::test]
 async fn test_single_fast_fields_only() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
 
     let ctx = SessionContext::new();
     ctx.register_table("t", Arc::new(provider)).unwrap();
@@ -151,7 +151,7 @@ async fn test_single_full_text_with_score() {
     use arrow::datatypes::Float32Type;
 
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
 
     let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
@@ -180,7 +180,7 @@ async fn test_single_full_text_with_score() {
 #[tokio::test]
 async fn test_single_full_text_with_filter() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
 
     let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
@@ -207,7 +207,7 @@ async fn test_single_full_text_with_filter() {
 #[tokio::test]
 async fn test_single_with_document() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
 
     let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
@@ -243,7 +243,7 @@ async fn test_single_three_way() {
     use arrow::datatypes::Float32Type;
 
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
 
     let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
@@ -277,7 +277,7 @@ async fn test_single_three_way() {
 #[tokio::test]
 async fn test_single_score_null_without_query() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
 
     let ctx = SessionContext::new();
     ctx.register_table("t", Arc::new(provider)).unwrap();
@@ -298,7 +298,7 @@ async fn test_single_score_null_without_query() {
 #[tokio::test]
 async fn test_single_document_without_inverted_index() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
 
     let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
@@ -323,7 +323,7 @@ async fn test_single_document_without_inverted_index() {
 #[tokio::test]
 async fn test_single_plan_no_joins() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
 
     let ctx = SessionContext::new();
     ctx.register_table("t", Arc::new(provider)).unwrap();
@@ -335,21 +335,21 @@ async fn test_single_plan_no_joins() {
     let batches = df.collect().await.unwrap();
     let plan = plan_to_string(&batches);
 
-    // Should NOT contain HashJoinExec -- single-table approach doesn't use joins
+    // Should NOT contain HashJoinExec -- the unified provider doesn't use joins.
     assert!(
         !plan.contains("HashJoinExec"),
-        "Single-table provider should not have joins.\n\nPlan:\n{plan}"
+        "Tantivy table provider should not have joins.\n\nPlan:\n{plan}"
     );
     assert!(
-        plan.contains("SingleTableDataSource"),
-        "Plan should contain SingleTableDataSource.\n\nPlan:\n{plan}"
+        plan.contains("TantivyDataSource"),
+        "Plan should contain TantivyDataSource.\n\nPlan:\n{plan}"
     );
 }
 
 #[tokio::test]
 async fn test_single_plan_with_query() {
     let index = create_test_index();
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
 
     let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
@@ -369,10 +369,10 @@ async fn test_single_plan_with_query() {
     // Key difference: even with FTS query, should NOT contain HashJoinExec
     assert!(
         !plan.contains("HashJoinExec"),
-        "Single-table provider should not have joins even with FTS query.\n\nPlan:\n{plan}"
+        "Tantivy table provider should not have joins even with FTS query.\n\nPlan:\n{plan}"
     );
     assert!(
-        plan.contains("SingleTableDataSource"),
-        "Plan should contain SingleTableDataSource.\n\nPlan:\n{plan}"
+        plan.contains("TantivyDataSource"),
+        "Plan should contain TantivyDataSource.\n\nPlan:\n{plan}"
     );
 }

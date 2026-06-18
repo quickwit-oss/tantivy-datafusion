@@ -1,10 +1,10 @@
-//! Benchmark: tantivy native aggregation vs unified SingleTableProvider.
+//! Benchmark: tantivy native aggregation vs unified TantivyTableProvider.
 //!
 //! Compares three execution paths:
 //! - **native**: tantivy AggregationCollector directly (baseline)
-//! - **unified_pushdown**: SingleTableProvider + AggPushdown optimizer rule
-//!   (should match native — AggDataSource calls the same collector)
-//! - **unified_sql**: SingleTableProvider without AggPushdown (DataFusion
+//! - **unified_pushdown**: TantivyTableProvider + AggPushdown optimizer rule
+//!   (should match native — TantivyAggDataSource calls the same collector)
+//! - **unified_sql**: TantivyTableProvider without AggPushdown (DataFusion
 //!   hash GROUP BY on Arrow batches — measures the overhead)
 //!
 //! Run with: `cargo bench -p tantivy-datafusion`
@@ -25,7 +25,7 @@ use tantivy::aggregation::AggregationCollector;
 use tantivy::query::AllQuery;
 use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, FAST, STRING};
 use tantivy::{doc, Index};
-use tantivy_datafusion::{AggPushdown, SingleTableProvider};
+use tantivy_datafusion::{AggPushdown, TantivyTableProvider};
 
 // ---------------------------------------------------------------------------
 // Index builder (1M docs, mixed cardinality)
@@ -172,8 +172,8 @@ impl NativeFreshReaderCtx {
     }
 }
 
-/// Unified path with AggPushdown: SQL through SingleTableProvider.
-/// AggPushdown rewrites AggregateExec → AggDataSource which calls
+/// Unified path with AggPushdown: SQL through TantivyTableProvider.
+/// AggPushdown rewrites AggregateExec → TantivyAggDataSource which calls
 /// tantivy's AggregationSegmentCollector. Should match native perf.
 struct UnifiedPushdownCtx {
     rt: tokio::runtime::Runtime,
@@ -194,7 +194,7 @@ impl UnifiedPushdownCtx {
             .with_physical_optimizer_rule(Arc::new(AggPushdown::new()))
             .build();
         let ctx = SessionContext::new_with_state(state);
-        ctx.register_table("t", Arc::new(SingleTableProvider::new(index.clone())))
+        ctx.register_table("t", Arc::new(TantivyTableProvider::new(index.clone())))
             .unwrap();
         let plan = rt.block_on(async {
             ctx.sql(sql)
@@ -234,7 +234,7 @@ impl UnifiedSqlCtx {
             .unwrap();
         let config = SessionConfig::new().with_target_partitions(1);
         let ctx = SessionContext::new_with_config(config);
-        ctx.register_table("t", Arc::new(SingleTableProvider::new(index.clone())))
+        ctx.register_table("t", Arc::new(TantivyTableProvider::new(index.clone())))
             .unwrap();
         let plan = rt.block_on(async {
             ctx.sql(sql)

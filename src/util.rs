@@ -1,4 +1,4 @@
-//! Shared utility functions used by both the unified (single-table) and
+//! Shared utility functions used by both the unified Tantivy table and
 //! decomposed (three-table join) provider approaches.
 
 use std::sync::atomic::{AtomicBool, Ordering};

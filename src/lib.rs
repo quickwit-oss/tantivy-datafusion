@@ -31,7 +31,7 @@ pub fn fast_field_read_name(field: &Field) -> &str {
 }
 
 // ---------------------------------------------------------------------------
-// Unified single-table approach
+// Unified Tantivy table approach
 // ---------------------------------------------------------------------------
 pub mod unified;
 
@@ -52,4 +52,4 @@ pub use split_runtime::{
 };
 pub use sync_exec::{SyncExecutionPool, SyncExecutionPoolExt, SyncExecutionPoolRef};
 pub use unified::agg_pushdown::AggPushdown;
-pub use unified::single_table_provider::SingleTableProvider;
+pub use unified::tantivy_table_provider::TantivyTableProvider;

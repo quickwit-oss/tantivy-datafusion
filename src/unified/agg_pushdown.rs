@@ -25,8 +25,8 @@ use tantivy::aggregation::metric::{
     AverageAggregation, CountAggregation, MaxAggregation, MinAggregation, SumAggregation,
 };
 
-use crate::unified::agg_data_source::AggDataSource;
-use crate::unified::plan_traversal::{find_partial_aggregate, find_single_table_datasource};
+use crate::unified::plan_traversal::{find_partial_aggregate, find_tantivy_table_datasource};
+use crate::unified::tantivy_agg_data_source::TantivyAggDataSource;
 use datafusion_datasource::source::DataSourceExec;
 
 /// A physical optimizer rule that replaces DataFusion's `AggregateExec`
@@ -84,7 +84,7 @@ impl PhysicalOptimizerRule for AggPushdown {
     }
 }
 
-/// Attempt to replace an `AggregateExec` subtree with a `DataSourceExec(AggDataSource)`.
+/// Attempt to replace an `AggregateExec` subtree with a `DataSourceExec(TantivyAggDataSource)`.
 fn try_rewrite(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
     let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() else {
         return Ok(Transformed::no(plan));
@@ -124,12 +124,12 @@ fn try_rewrite_single(
 
     let input = agg.input();
 
-    if let Some(st_ds) = find_single_table_datasource(input) {
+    if let Some(st_ds) = find_tantivy_table_datasource(input) {
         if !agg_fields_exist_on_all_splits(agg, st_ds) {
             return Transformed::no(plan.clone());
         }
         if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg).map(Arc::new) {
-            let agg_ds = AggDataSource::from_split_descriptors_with_runtime_factory(
+            let agg_ds = TantivyAggDataSource::from_split_descriptors_with_runtime_factory(
                 st_ds.split_descriptors(),
                 tantivy_aggs,
                 agg.schema(),
@@ -146,7 +146,7 @@ fn try_rewrite_single(
 }
 
 /// Rewrite two-phase: keep `AggregateExec(Final*)` and replace the partial side
-/// with a partitioned `AggDataSource` that emits DataFusion-compatible partial
+/// with a partitioned `TantivyAggDataSource` that emits DataFusion-compatible partial
 /// aggregate state rows.
 fn try_rewrite_two_phase(
     final_agg: &AggregateExec,
@@ -170,20 +170,21 @@ fn try_rewrite_two_phase(
 
     let partial_input = partial_agg.input();
 
-    if let Some(st_ds) = find_single_table_datasource(partial_input) {
+    if let Some(st_ds) = find_tantivy_table_datasource(partial_input) {
         if !agg_fields_exist_on_all_splits(final_agg, st_ds) {
             return Ok(Transformed::no(plan.clone()));
         }
         if let Some(tantivy_aggs) = derive_tantivy_partial_aggregations(partial_agg).map(Arc::new) {
-            let agg_ds = AggDataSource::from_split_descriptors_partial_states_with_runtime_factory(
-                st_ds.split_descriptors(),
-                tantivy_aggs,
-                partial_agg.schema(),
-                st_ds.raw_queries().to_vec(),
-                st_ds.pre_built_query().cloned(),
-                st_ds.fast_field_filter_exprs().to_vec(),
-                st_ds.local_runtime_factory(),
-            );
+            let agg_ds =
+                TantivyAggDataSource::from_split_descriptors_partial_states_with_runtime_factory(
+                    st_ds.split_descriptors(),
+                    tantivy_aggs,
+                    partial_agg.schema(),
+                    st_ds.raw_queries().to_vec(),
+                    st_ds.pre_built_query().cloned(),
+                    st_ds.fast_field_filter_exprs().to_vec(),
+                    st_ds.local_runtime_factory(),
+                );
             let replacement: Arc<dyn ExecutionPlan> =
                 Arc::new(DataSourceExec::new(Arc::new(agg_ds)));
             let rewritten_input =
@@ -215,7 +216,7 @@ fn replace_partial_aggregate(
 
 fn agg_fields_exist_on_all_splits(
     agg: &AggregateExec,
-    data_source: &crate::unified::single_table_provider::SingleTableDataSource,
+    data_source: &crate::unified::tantivy_table_provider::TantivyDataSource,
 ) -> bool {
     let referenced_fields = referenced_agg_fields(agg);
     data_source.split_descriptors().into_iter().all(|split| {

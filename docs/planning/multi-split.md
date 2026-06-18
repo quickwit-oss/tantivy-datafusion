@@ -1,26 +1,26 @@
-# Multi-Split SingleTableProvider for Quickwit Integration
+# Multi-Split TantivyTableProvider for Quickwit Integration
 
 ## Problem
 
 Quickwit queries span multiple splits (each split = one tantivy index with 1+ segments). Currently:
-- `SingleTableProvider` accepts one `IndexOpener` (one split)
+- `TantivyTableProvider` accepts one `IndexOpener` (one split)
 - Quickwit PR #6160 creates a per-split provider and UNION ALLs them
 - UNION ALL means N copies of the same plan pattern — optimizer can't reason globally
 - The PR itself notes this should be a single logical table
 
 ## Goal
 
-`SingleTableProvider` accepts `Vec<Arc<dyn IndexOpener>>` — one per split. Partitions span all segments across all splits. One plan, one table, global optimization.
+`TantivyTableProvider` accepts `Vec<Arc<dyn IndexOpener>>` — one per split. Partitions span all segments across all splits. One plan, one table, global optimization.
 
 ## API
 
 ```rust
 // Multi-split (new):
-let provider = SingleTableProvider::from_openers(vec![opener_a, opener_b, opener_c]);
+let provider = TantivyTableProvider::from_openers(vec![opener_a, opener_b, opener_c]);
 
 // Single-split (unchanged):
-let provider = SingleTableProvider::new(index);
-let provider = SingleTableProvider::from_opener(opener);  // wraps in vec![opener]
+let provider = TantivyTableProvider::new(index);
+let provider = TantivyTableProvider::from_opener(opener);  // wraps in vec![opener]
 ```
 
 ## Partition Model
@@ -34,7 +34,7 @@ Opener C: 3 segments → partitions 3, 4, 5
 Total: 6 partitions
 ```
 
-`SingleTableDataSource` stores a mapping:
+`TantivyDataSource` stores a mapping:
 ```rust
 struct PartitionMapping {
     opener: Arc<dyn IndexOpener>,
@@ -92,9 +92,9 @@ for opener in &openers {
 
 DataFusion can prune entire splits via timestamp min/max per partition.
 
-## Aggregation (AggDataSource)
+## Aggregation (TantivyAggDataSource)
 
-`AggDataSource` accepts `Vec<Arc<dyn IndexOpener>>`. Aggregation runs per-split, intermediates merged:
+`TantivyAggDataSource` accepts `Vec<Arc<dyn IndexOpener>>`. Aggregation runs per-split, intermediates merged:
 
 ```rust
 let mut merged = None;
@@ -105,7 +105,7 @@ for opener in &openers {
 }
 ```
 
-Or: each split is a separate partition in AggDataSource. DataFusion merges.
+Or: each split is a separate partition in TantivyAggDataSource. DataFusion merges.
 
 ## Codec (Distributed Execution)
 
@@ -135,7 +135,7 @@ async fn scan(&self, state, projection, filters, limit) -> Result<Arc<dyn Execut
         .collect();
 
     // 3. Single provider, all splits
-    let provider = SingleTableProvider::from_openers(openers);
+    let provider = TantivyTableProvider::from_openers(openers);
     provider.scan(state, projection, filters, limit).await
 }
 ```
@@ -154,8 +154,8 @@ No UNION ALL. One plan. DataFusion sees all partitions globally.
 
 | File | Change |
 |------|--------|
-| `src/unified/single_table_provider.rs` | Accept `Vec<Arc<dyn IndexOpener>>`, partition mapping, per-opener warmup |
-| `src/unified/agg_data_source.rs` | Accept `Vec<Arc<dyn IndexOpener>>`, per-split aggregation |
+| `src/unified/tantivy_table_provider.rs` | Accept `Vec<Arc<dyn IndexOpener>>`, partition mapping, per-opener warmup |
+| `src/unified/tantivy_agg_data_source.rs` | Accept `Vec<Arc<dyn IndexOpener>>`, per-split aggregation |
 | `src/codec.rs` | Serialize/deserialize multi-opener + partition mapping |
 | `src/index_opener.rs` | No changes to trait — `OpenerMetadata` unchanged |
 

@@ -12,7 +12,7 @@ The overhead grows with data size, which is unacceptable.
 - Schema: `text_few_terms_status` (STRING | FAST, 7 categories), plus 4 other fields
 - Query: `SELECT text_few_terms_status, COUNT(*) GROUP BY text_few_terms_status`
 - Native: `searcher.search(&AllQuery, &AggregationCollector)` — reuses pre-built reader/searcher
-- Pushdown: `SingleTableProvider` + `AggPushdown` rule → `AggDataSource` → `execute_tantivy_agg`
+- Pushdown: `TantivyTableProvider` + `AggPushdown` rule → `TantivyAggDataSource` → `execute_tantivy_agg`
 
 ### Bench numbers (stable, plugged in)
 
@@ -63,7 +63,7 @@ unique terms in column), not the requested `size`.
 
 ### ❌ target_partitions setting
 **Result**: Disproven. partitions=1 vs partitions=10 makes no difference for
-AggDataSource (only partition 0 executes).
+TantivyAggDataSource (only partition 0 executes).
 
 ### ✅ Warmup creating IndexReaders per query
 **Result**: Confirmed as ~200ms overhead at 10M. Each warmup function

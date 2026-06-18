@@ -8,7 +8,7 @@ use tantivy::schema::{
 };
 use tantivy::{Index, IndexWriter, TantivyDocument};
 use tantivy_datafusion::fast_field_reader::read_segment_fast_fields_to_batch;
-use tantivy_datafusion::{full_text_udf, SingleTableProvider, FAST_FIELD_READ_NAME_METADATA_KEY};
+use tantivy_datafusion::{full_text_udf, TantivyTableProvider, FAST_FIELD_READ_NAME_METADATA_KEY};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -84,7 +84,7 @@ async fn run_sql(ctx: &SessionContext, sql: &str) -> RecordBatch {
 /// Set up a session with a filter-test index registered as table "t".
 fn setup_filter_session() -> SessionContext {
     let index = create_filter_test_index();
-    let provider = SingleTableProvider::new(index);
+    let provider = TantivyTableProvider::new(index);
 
     let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
@@ -471,7 +471,7 @@ fn test_utf8_projection_reads_scalar_string_fast_field() {
     );
 }
 
-/// SQL-level test: UNION two SingleTableProviders with different schemas.
+/// SQL-level test: UNION two TantivyTableProviders with different schemas.
 /// Each provider returns nulls for columns it doesn't have.
 #[tokio::test]
 async fn test_schema_evolution_via_union() {
@@ -503,8 +503,8 @@ async fn test_schema_evolution_via_union() {
     w2.add_document(doc).unwrap();
     w2.commit().unwrap();
 
-    let provider1 = SingleTableProvider::new(index1);
-    let provider2 = SingleTableProvider::new(index2);
+    let provider1 = TantivyTableProvider::new(index1);
+    let provider2 = TantivyTableProvider::new(index2);
 
     let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
