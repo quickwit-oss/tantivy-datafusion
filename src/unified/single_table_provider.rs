@@ -33,9 +33,10 @@ use tantivy::collector::TopDocs;
 use tantivy::query::RangeQuery;
 use tantivy::schema::{FieldType, IndexRecordOption, Schema as TantivySchema, Term};
 use tantivy::{DateTime, DocAddress, Document, Index};
+use tracing::debug;
 
 use crate::fast_field_reader::{read_segment_fast_fields_to_batch, DictCache};
-use crate::full_text_udf::extract_full_text_call;
+use crate::full_text_udf::{extract_full_text_filter, extract_full_text_or_group};
 use crate::index_opener::{DirectIndexOpener, IndexOpener, OpenerSplitRuntimeFactory};
 use crate::schema_mapping::tantivy_schema_to_arrow_with_multi_valued;
 use crate::split_runtime::{
@@ -122,11 +123,12 @@ fn split_descriptor_from_opener(
     opener: &Arc<dyn IndexOpener>,
     fallback_id: impl Into<String>,
 ) -> SplitDescriptor {
-    SplitDescriptor::new(
+    SplitDescriptor::new_with_fast_field_schema(
         fallback_id.into(),
         Vec::new(),
         opener.schema(),
         opener.multi_valued_fields(),
+        fast_field_schema_for_opener(opener),
     )
 }
 
@@ -186,6 +188,22 @@ fn analyze_fast_field_filter_support(
         return FilterPushdownSupport::Unsupported;
     };
 
+    match binary.op {
+        Operator::And => {
+            return combine_fast_field_filter_support_for_and(
+                analyze_fast_field_filter_support(binary.left.as_ref(), tantivy_schema),
+                analyze_fast_field_filter_support(binary.right.as_ref(), tantivy_schema),
+            );
+        }
+        Operator::Or => {
+            return combine_fast_field_filter_support_for_or(
+                analyze_fast_field_filter_support(binary.left.as_ref(), tantivy_schema),
+                analyze_fast_field_filter_support(binary.right.as_ref(), tantivy_schema),
+            );
+        }
+        _ => {}
+    }
+
     let column_name = match (binary.left.as_ref(), binary.right.as_ref()) {
         (Expr::Column(col), Expr::Literal(_, _)) => Some(col.name.as_str()),
         (Expr::Literal(_, _), Expr::Column(col)) => Some(col.name.as_str()),
@@ -203,6 +221,40 @@ fn analyze_fast_field_filter_support(
         FilterPushdownSupport::Query
     } else {
         FilterPushdownSupport::Unsupported
+    }
+}
+
+fn combine_fast_field_filter_support_for_and(
+    left: FilterPushdownSupport,
+    right: FilterPushdownSupport,
+) -> FilterPushdownSupport {
+    match (left, right) {
+        (FilterPushdownSupport::Unsupported, _) | (_, FilterPushdownSupport::Unsupported) => {
+            FilterPushdownSupport::Unsupported
+        }
+        (FilterPushdownSupport::MissingField, _) | (_, FilterPushdownSupport::MissingField) => {
+            FilterPushdownSupport::MissingField
+        }
+        (FilterPushdownSupport::Query, FilterPushdownSupport::Query) => {
+            FilterPushdownSupport::Query
+        }
+    }
+}
+
+fn combine_fast_field_filter_support_for_or(
+    left: FilterPushdownSupport,
+    right: FilterPushdownSupport,
+) -> FilterPushdownSupport {
+    match (left, right) {
+        (FilterPushdownSupport::Unsupported, _) | (_, FilterPushdownSupport::Unsupported) => {
+            FilterPushdownSupport::Unsupported
+        }
+        (FilterPushdownSupport::Query, _) | (_, FilterPushdownSupport::Query) => {
+            FilterPushdownSupport::Query
+        }
+        (FilterPushdownSupport::MissingField, FilterPushdownSupport::MissingField) => {
+            FilterPushdownSupport::MissingField
+        }
     }
 }
 
@@ -257,11 +309,11 @@ fn translate_partition_stat(
     let mut column_stats = Vec::new();
 
     for column in &projection.columns {
-        let Some(source_name) = &column.source_name else {
+        let [source] = column.sources.as_slice() else {
             continue;
         };
         if !matches!(
-            column.coercion,
+            source.coercion,
             crate::type_coercion::FastFieldCoercion::Exact
         ) {
             continue;
@@ -269,7 +321,7 @@ fn translate_partition_stat(
         if let Some((_, min_val, max_val)) = stat
             .column_stats
             .iter()
-            .find(|(name, _, _)| name == source_name)
+            .find(|(name, _, _)| name == &source.source_name)
         {
             column_stats.push((
                 column.output_field.name().to_string(),
@@ -288,10 +340,9 @@ fn translate_partition_stat(
 
 /// A single-table DataFusion provider for tantivy indexes.
 ///
-/// Unlike [`UnifiedTantivyTableProvider`](crate::unified_provider::UnifiedTantivyTableProvider),
-/// which composes three separate data sources joined by `HashJoinExec`, this
-/// provider handles FTS queries, fast field reading, scoring, and document
-/// retrieval in a single pass per split partition.
+/// Unlike earlier decomposed providers that joined separate data sources with
+/// `HashJoinExec`, this provider handles FTS queries, fast field reading,
+/// scoring, and document retrieval in a single pass per split partition.
 ///
 /// The schema is identical: `[_doc_id, _segment_ord, fast_field_1, ..., fast_field_n, _score, _document]`
 ///
@@ -409,12 +460,7 @@ impl SingleTableProvider {
 
         let split_schemas: Vec<SchemaRef> = split_descriptors
             .iter()
-            .map(|descriptor| {
-                tantivy_schema_to_arrow_with_multi_valued(
-                    &descriptor.tantivy_schema,
-                    &descriptor.multi_valued_fields,
-                )
-            })
+            .map(SplitDescriptor::fast_field_schema)
             .collect();
         let canonical_ff_schema = infer_canonical_fast_field_schema(&split_schemas)?;
         Self::from_split_descriptors_with_fast_field_schema(split_descriptors, canonical_ff_schema)
@@ -434,10 +480,7 @@ impl SingleTableProvider {
         let splits: Vec<PlannedSplit> = split_descriptors
             .into_iter()
             .map(|descriptor| PlannedSplit {
-                fast_field_schema: tantivy_schema_to_arrow_with_multi_valued(
-                    &descriptor.tantivy_schema,
-                    &descriptor.multi_valued_fields,
-                ),
+                fast_field_schema: descriptor.fast_field_schema(),
                 descriptor,
                 partition_stat: None,
                 needs_warmup: true,
@@ -464,6 +507,170 @@ impl SingleTableProvider {
             local_runtime_factory,
         }
     }
+
+    fn plan_scan_schema(&self, projection: Option<&Vec<usize>>) -> Result<ScanSchema> {
+        let projected_indices: Vec<usize> = match projection {
+            Some(indices) => indices.clone(),
+            None => (0..self.unified_schema.fields().len()).collect(),
+        };
+
+        let mut needs_score = false;
+        let mut needs_document = false;
+        let mut ff_indices = Vec::new();
+
+        for &idx in &projected_indices {
+            if idx == self.score_column_idx {
+                needs_score = true;
+            } else if idx == self.document_column_idx {
+                needs_document = true;
+            } else {
+                ff_indices.push(idx);
+            }
+        }
+
+        ff_indices.sort_unstable();
+        ff_indices.dedup();
+        add_required_fast_field_indices(&mut ff_indices, &self.fast_field_schema, needs_document)?;
+
+        let ff_projected = {
+            let fields: Vec<Field> = ff_indices
+                .iter()
+                .map(|&i| self.fast_field_schema.field(i).clone())
+                .collect();
+            Arc::new(Schema::new(fields))
+        };
+        let projected = {
+            let fields: Vec<Field> = projected_indices
+                .iter()
+                .map(|&i| self.unified_schema.field(i).clone())
+                .collect();
+            Arc::new(Schema::new(fields))
+        };
+
+        Ok(ScanSchema {
+            unified: self.unified_schema.clone(),
+            projected,
+            ff_projected,
+            projection: projection.cloned(),
+            score_idx: self.score_column_idx,
+            document_idx: self.document_column_idx,
+            needs_score,
+            needs_document,
+        })
+    }
+}
+
+fn add_required_fast_field_indices(
+    ff_indices: &mut Vec<usize>,
+    fast_field_schema: &SchemaRef,
+    needs_document: bool,
+) -> Result<()> {
+    let doc_id_idx = fast_field_schema.index_of("_doc_id").map_err(|_| {
+        DataFusionError::Internal("fast field schema missing required _doc_id column".into())
+    })?;
+    let segment_ord_idx = fast_field_schema.index_of("_segment_ord").map_err(|_| {
+        DataFusionError::Internal("fast field schema missing required _segment_ord column".into())
+    })?;
+    if ff_indices.is_empty() || (needs_document && !ff_indices.contains(&doc_id_idx)) {
+        ff_indices.push(doc_id_idx);
+    }
+    if needs_document && !ff_indices.contains(&segment_ord_idx) {
+        ff_indices.push(segment_ord_idx);
+    }
+    ff_indices.sort_unstable();
+    ff_indices.dedup();
+    Ok(())
+}
+
+struct PushedDownFilters {
+    raw_queries: Vec<(String, String)>,
+    raw_not_queries: Vec<(String, String)>,
+    raw_query_groups: Vec<Vec<(String, String)>>,
+    fast_field_filter_exprs: Vec<Expr>,
+}
+
+fn collect_pushed_down_filters(filters: &[Expr], splits: &[PlannedSplit]) -> PushedDownFilters {
+    let mut pushed = PushedDownFilters {
+        raw_queries: Vec::new(),
+        raw_not_queries: Vec::new(),
+        raw_query_groups: Vec::new(),
+        fast_field_filter_exprs: Vec::new(),
+    };
+
+    for filter in filters {
+        if let Some(full_text_filter) = extract_full_text_filter(filter) {
+            let query = (full_text_filter.field_name, full_text_filter.query_string);
+            if full_text_filter.negated {
+                pushed.raw_not_queries.push(query);
+            } else {
+                pushed.raw_queries.push(query);
+            }
+        } else if let Some(group) = extract_full_text_or_group(filter) {
+            pushed
+                .raw_query_groups
+                .push(existing_full_text_group(group, splits));
+        } else if filter_is_pushdown_safe(filter, splits) {
+            pushed.fast_field_filter_exprs.push(filter.clone());
+        }
+    }
+
+    pushed
+}
+
+fn existing_full_text_group(
+    group: Vec<(String, String)>,
+    splits: &[PlannedSplit],
+) -> Vec<(String, String)> {
+    group
+        .into_iter()
+        .filter(|(field_name, _)| {
+            splits.iter().any(|split| {
+                split
+                    .descriptor
+                    .tantivy_schema
+                    .get_field(field_name)
+                    .is_ok()
+            })
+        })
+        .collect()
+}
+
+fn cached_pre_built_query(
+    splits: &[PlannedSplit],
+    fast_field_filter_exprs: &[Expr],
+) -> Option<Arc<dyn tantivy::query::Query>> {
+    if splits.len() == 1 {
+        build_split_fast_field_query(
+            fast_field_filter_exprs,
+            &splits[0].descriptor.tantivy_schema,
+        )
+    } else {
+        None
+    }
+}
+
+fn split_execution_plans(splits: &[PlannedSplit]) -> Vec<SplitExecutionPlan> {
+    splits
+        .iter()
+        .map(|split| SplitExecutionPlan {
+            descriptor: split.descriptor.clone(),
+            needs_warmup: split.needs_warmup,
+        })
+        .collect()
+}
+
+fn scan_partition_stats(
+    splits: &[PlannedSplit],
+    ff_projected_schema: &SchemaRef,
+) -> Vec<Option<PartitionStat>> {
+    splits
+        .iter()
+        .map(|split| {
+            let projection =
+                plan_fast_field_projection(&split.fast_field_schema, ff_projected_schema).ok()?;
+            translate_partition_stat(split.partition_stat.as_ref(), &projection)
+        })
+        .collect()
 }
 
 impl fmt::Debug for SingleTableProvider {
@@ -499,7 +706,8 @@ impl TableProvider for SingleTableProvider {
         Ok(filters
             .iter()
             .map(|f| {
-                if extract_full_text_call(f).is_some() {
+                if extract_full_text_filter(f).is_some() || extract_full_text_or_group(f).is_some()
+                {
                     TableProviderFilterPushDown::Exact
                 } else if filter_is_pushdown_safe(f, &self.splits) {
                     TableProviderFilterPushDown::Inexact
@@ -517,137 +725,23 @@ impl TableProvider for SingleTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // 1. Extract full_text() calls and fast field filters from pushed-down filters.
-        let mut raw_queries: Vec<(String, String)> = Vec::new();
-        let mut fast_field_filter_exprs: Vec<Expr> = Vec::new();
-        for filter in filters {
-            if let Some((field_name, query_string)) = extract_full_text_call(filter) {
-                let field_exists = self.splits.iter().any(|split| {
-                    split
-                        .descriptor
-                        .tantivy_schema
-                        .get_field(&field_name)
-                        .is_ok()
-                });
-                if !field_exists {
-                    return Err(DataFusionError::Plan(format!(
-                        "full_text: field '{field_name}' not found in any split"
-                    )));
-                }
-                raw_queries.push((field_name, query_string));
-            } else if filter_is_pushdown_safe(filter, &self.splits) {
-                fast_field_filter_exprs.push(filter.clone());
-            }
-        }
-        let cached_pre_built_query = if self.splits.len() == 1 {
-            build_split_fast_field_query(
-                &fast_field_filter_exprs,
-                &self.splits[0].descriptor.tantivy_schema,
-            )
-        } else {
-            None
-        };
-
-        // 2. Analyze projection.
-        let projected_indices: Vec<usize> = match projection {
-            Some(indices) => indices.clone(),
-            None => (0..self.unified_schema.fields().len()).collect(),
-        };
-
-        let mut needs_score = false;
-        let mut needs_document = false;
-        let mut ff_indices = Vec::new();
-
-        for &idx in &projected_indices {
-            if idx == self.score_column_idx {
-                needs_score = true;
-            } else if idx == self.document_column_idx {
-                needs_document = true;
-            } else {
-                ff_indices.push(idx);
-            }
-        }
-
-        ff_indices.sort();
-        ff_indices.dedup();
-        // _doc_id and _segment_ord are always needed: as a fallback when no
-        // fast fields are projected, and for async document fetch.
-        let doc_id_idx = self.fast_field_schema.index_of("_doc_id").map_err(|_| {
-            DataFusionError::Internal("fast field schema missing required _doc_id column".into())
-        })?;
-        let segment_ord_idx = self
-            .fast_field_schema
-            .index_of("_segment_ord")
-            .map_err(|_| {
-                DataFusionError::Internal(
-                    "fast field schema missing required _segment_ord column".into(),
-                )
-            })?;
-        if ff_indices.is_empty() || (needs_document && !ff_indices.contains(&doc_id_idx)) {
-            ff_indices.push(doc_id_idx);
-        }
-        if needs_document && !ff_indices.contains(&segment_ord_idx) {
-            ff_indices.push(segment_ord_idx);
-        }
-        ff_indices.sort();
-        ff_indices.dedup();
-
-        let ff_projected_schema = {
-            let fields: Vec<Field> = ff_indices
-                .iter()
-                .map(|&i| self.fast_field_schema.field(i).clone())
-                .collect();
-            Arc::new(Schema::new(fields))
-        };
-
-        let projected_schema = {
-            let fields: Vec<Field> = projected_indices
-                .iter()
-                .map(|&i| self.unified_schema.field(i).clone())
-                .collect();
-            Arc::new(Schema::new(fields))
-        };
-
-        let split_plans: Vec<SplitExecutionPlan> = self
-            .splits
-            .iter()
-            .map(|split| {
-                Ok(SplitExecutionPlan {
-                    descriptor: split.descriptor.clone(),
-                    needs_warmup: split.needs_warmup,
-                })
-            })
-            .collect::<Result<_>>()?;
-
+        let pushed = collect_pushed_down_filters(filters, &self.splits);
+        let cached_pre_built_query =
+            cached_pre_built_query(&self.splits, &pushed.fast_field_filter_exprs);
+        let schema = self.plan_scan_schema(projection)?;
         let partition_map: Vec<PartitionSpec> = (0..self.splits.len())
             .map(|split_idx| PartitionSpec { split_idx })
             .collect();
-        let partition_stats: Vec<Option<PartitionStat>> = self
-            .splits
-            .iter()
-            .map(|split| {
-                let projection =
-                    plan_fast_field_projection(&split.fast_field_schema, &ff_projected_schema)
-                        .ok()?;
-                translate_partition_stat(split.partition_stat.as_ref(), &projection)
-            })
-            .collect();
+        let partition_stats = scan_partition_stats(&self.splits, &schema.ff_projected);
 
         let data_source = SingleTableDataSource {
-            splits: split_plans,
-            schema: ScanSchema {
-                unified: self.unified_schema.clone(),
-                projected: projected_schema,
-                ff_projected: ff_projected_schema,
-                projection: projection.cloned(),
-                score_idx: self.score_column_idx,
-                document_idx: self.document_column_idx,
-                needs_score,
-                needs_document,
-            },
-            raw_queries,
+            splits: split_execution_plans(&self.splits),
+            schema,
+            raw_queries: pushed.raw_queries,
+            raw_not_queries: pushed.raw_not_queries,
+            raw_query_groups: pushed.raw_query_groups,
             pre_built_query: cached_pre_built_query,
-            fast_field_filter_exprs,
+            fast_field_filter_exprs: pushed.fast_field_filter_exprs,
             topk: None,
             row_limit: limit,
             partition_map,
@@ -682,10 +776,24 @@ pub(crate) struct ScanSchema {
     pub(crate) needs_document: bool,
 }
 
+pub(crate) struct SingleTableCodecFields {
+    pub(crate) splits: Vec<SplitExecutionPlan>,
+    pub(crate) schema: ScanSchema,
+    pub(crate) raw_queries: Vec<(String, String)>,
+    pub(crate) raw_not_queries: Vec<(String, String)>,
+    pub(crate) raw_query_groups: Vec<Vec<(String, String)>>,
+    pub(crate) fast_field_filter_exprs: Vec<Expr>,
+    pub(crate) topk: Option<usize>,
+    pub(crate) row_limit: Option<usize>,
+    pub(crate) partition_map: Vec<PartitionSpec>,
+}
+
 pub struct SingleTableDataSource {
     splits: Vec<SplitExecutionPlan>,
     schema: ScanSchema,
     raw_queries: Vec<(String, String)>,
+    raw_not_queries: Vec<(String, String)>,
+    raw_query_groups: Vec<Vec<(String, String)>>,
     /// Cached fast field query for the single-split case.
     pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
     /// Source logical `Expr`s that were successfully converted to tantivy
@@ -706,6 +814,67 @@ pub struct SingleTableDataSource {
     metrics: ExecutionPlanMetricsSet,
 }
 
+type BatchSender = tokio::sync::mpsc::Sender<Result<RecordBatch>>;
+
+struct SingleTableOpenInput {
+    context: Arc<datafusion::execution::TaskContext>,
+    sync_pool: crate::sync_exec::SyncExecutionPoolRef,
+    split: SplitExecutionPlan,
+    local_runtime_factory: Option<SplitRuntimeFactoryRef>,
+    warmup_done: Arc<tokio::sync::OnceCell<()>>,
+    needs_warmup: bool,
+    batch_size: usize,
+    raw_queries: Vec<(String, String)>,
+    raw_not_queries: Vec<(String, String)>,
+    raw_query_groups: Vec<Vec<(String, String)>>,
+    fast_field_filter_exprs: Vec<Expr>,
+    pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+    ff_projected_schema: SchemaRef,
+    projected_schema: SchemaRef,
+    unified_schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    needs_score: bool,
+    needs_document: bool,
+    score_column_idx: usize,
+    document_column_idx: usize,
+    topk: Option<usize>,
+    row_limit: Option<usize>,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct SingleTableWarmupInput {
+    searcher: tantivy::Searcher,
+    tantivy_schema: TantivySchema,
+    source_ff_schema: SchemaRef,
+    raw_queries: Vec<(String, String)>,
+    raw_not_queries: Vec<(String, String)>,
+    raw_query_groups: Vec<Vec<(String, String)>>,
+    fast_field_filter_exprs: Vec<Expr>,
+}
+
+struct BlockingScanInput {
+    sync_pool: crate::sync_exec::SyncExecutionPoolRef,
+    prepared: Arc<PreparedSplit>,
+    batch_size: usize,
+    source_ff_schema: SchemaRef,
+    fast_field_projection: FastFieldProjectionPlan,
+    unified_schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    score_column_idx: usize,
+    document_column_idx: usize,
+    needs_score: bool,
+    needs_document: bool,
+    topk: Option<usize>,
+    row_limit: Option<usize>,
+    raw_queries: Vec<(String, String)>,
+    raw_not_queries: Vec<(String, String)>,
+    raw_query_groups: Vec<Vec<(String, String)>>,
+    fast_field_filter_exprs: Vec<Expr>,
+    pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+    cancelled: Arc<AtomicBool>,
+    projected_schema: SchemaRef,
+}
+
 impl fmt::Debug for SingleTableDataSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SingleTableDataSource")
@@ -722,36 +891,31 @@ impl SingleTableDataSource {
     /// Construct a `SingleTableDataSource` directly from deserialized codec
     /// fields, bypassing `TableProvider::scan` and `SessionContext`. Used by
     /// `TantivyCodec::try_decode` to reconstruct a `DataSourceExec` on workers.
-    pub(crate) fn new_from_codec(
-        splits: Vec<SplitExecutionPlan>,
-        schema: ScanSchema,
-        raw_queries: Vec<(String, String)>,
-        fast_field_filter_exprs: Vec<Expr>,
-        topk: Option<usize>,
-        row_limit: Option<usize>,
-        partition_map: Vec<PartitionSpec>,
-    ) -> Self {
-        let warmup_done = splits
+    pub(crate) fn new_from_codec(fields: SingleTableCodecFields) -> Self {
+        let warmup_done = fields
+            .splits
             .iter()
             .map(|_| Arc::new(tokio::sync::OnceCell::new()))
             .collect();
         Self {
-            pre_built_query: if splits.len() == 1 {
+            pre_built_query: if fields.splits.len() == 1 {
                 build_split_fast_field_query(
-                    &fast_field_filter_exprs,
-                    &splits[0].descriptor.tantivy_schema,
+                    &fields.fast_field_filter_exprs,
+                    &fields.splits[0].descriptor.tantivy_schema,
                 )
             } else {
                 None
             },
-            splits,
-            schema,
-            raw_queries,
-            fast_field_filter_exprs,
-            topk,
-            row_limit,
-            partition_stats: vec![None; partition_map.len()],
-            partition_map,
+            partition_stats: vec![None; fields.partition_map.len()],
+            splits: fields.splits,
+            schema: fields.schema,
+            raw_queries: fields.raw_queries,
+            raw_not_queries: fields.raw_not_queries,
+            raw_query_groups: fields.raw_query_groups,
+            fast_field_filter_exprs: fields.fast_field_filter_exprs,
+            topk: fields.topk,
+            row_limit: fields.row_limit,
+            partition_map: fields.partition_map,
             local_runtime_factory: None,
             warmup_done,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -763,6 +927,8 @@ impl SingleTableDataSource {
             splits: self.splits.clone(),
             schema: self.schema.clone(),
             raw_queries: self.raw_queries.clone(),
+            raw_not_queries: self.raw_not_queries.clone(),
+            raw_query_groups: self.raw_query_groups.clone(),
             pre_built_query: self.pre_built_query.clone(),
             fast_field_filter_exprs: self.fast_field_filter_exprs.clone(),
             topk: self.topk,
@@ -777,12 +943,71 @@ impl SingleTableDataSource {
         new
     }
 
+    fn open_input(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<SingleTableOpenInput> {
+        let partition_spec = *self.partition_map.get(partition).ok_or_else(|| {
+            DataFusionError::Internal(format!("invalid partition index {partition}"))
+        })?;
+        let split = self
+            .splits
+            .get(partition_spec.split_idx)
+            .ok_or_else(|| DataFusionError::Internal("invalid split index".to_string()))?
+            .clone();
+        let warmup_done = Arc::clone(
+            self.warmup_done
+                .get(partition_spec.split_idx)
+                .ok_or_else(|| DataFusionError::Internal("invalid warmup split index".into()))?,
+        );
+        let pre_built_query = if self.splits.len() == 1 {
+            self.pre_built_query
+                .as_ref()
+                .map(|q| Arc::from(q.box_clone()))
+        } else {
+            None
+        };
+        let needs_warmup = split_needs_warmup(&split);
+
+        Ok(SingleTableOpenInput {
+            sync_pool: crate::sync_exec::get_or_default_pool(context.as_ref()),
+            split,
+            local_runtime_factory: self.local_runtime_factory.clone(),
+            warmup_done,
+            needs_warmup,
+            batch_size: context.session_config().batch_size(),
+            raw_queries: self.raw_queries.clone(),
+            raw_not_queries: self.raw_not_queries.clone(),
+            raw_query_groups: self.raw_query_groups.clone(),
+            fast_field_filter_exprs: self.fast_field_filter_exprs.clone(),
+            pre_built_query,
+            ff_projected_schema: self.schema.ff_projected.clone(),
+            projected_schema: self.schema.projected.clone(),
+            unified_schema: self.schema.unified.clone(),
+            projection: self.schema.projection.clone(),
+            needs_score: self.schema.needs_score,
+            needs_document: self.schema.needs_document,
+            score_column_idx: self.schema.score_idx,
+            document_column_idx: self.schema.document_idx,
+            topk: self.topk,
+            row_limit: self.row_limit,
+            cancelled,
+            context,
+        })
+    }
+
     /// Access the split descriptors.
     pub fn split_descriptors(&self) -> Vec<SplitDescriptor> {
         self.splits
             .iter()
             .map(|split| split.descriptor.clone())
             .collect()
+    }
+
+    pub(crate) fn split_descriptor_refs(&self) -> impl Iterator<Item = &SplitDescriptor> + '_ {
+        self.splits.iter().map(|split| &split.descriptor)
     }
 
     pub fn local_runtime_factory(&self) -> Option<SplitRuntimeFactoryRef> {
@@ -792,6 +1017,16 @@ impl SingleTableDataSource {
     /// Access the raw full-text queries.
     pub fn raw_queries(&self) -> &[(String, String)] {
         &self.raw_queries
+    }
+
+    /// Access the negated raw full-text queries.
+    pub fn raw_not_queries(&self) -> &[(String, String)] {
+        &self.raw_not_queries
+    }
+
+    /// Access OR-groups of raw full-text queries.
+    pub fn raw_query_groups(&self) -> &[Vec<(String, String)>] {
+        &self.raw_query_groups
     }
 
     /// The number of partitions this data source is partitioned over.
@@ -812,6 +1047,8 @@ impl SingleTableDataSource {
     /// Whether this data source has an active query.
     pub fn has_query(&self) -> bool {
         !self.raw_queries.is_empty()
+            || !self.raw_not_queries.is_empty()
+            || !self.raw_query_groups.is_empty()
             || self.pre_built_query.is_some()
             || !self.fast_field_filter_exprs.is_empty()
     }
@@ -974,8 +1211,250 @@ async fn prepare_split(
     factory.prepare_split(&split.descriptor).await
 }
 
+async fn resolve_split_fast_field_schema(
+    split: &SplitExecutionPlan,
+    requested_schema: &SchemaRef,
+    prepared: Arc<PreparedSplit>,
+    local_runtime_factory: Option<&SplitRuntimeFactoryRef>,
+    context: &datafusion::execution::TaskContext,
+) -> Result<SchemaRef> {
+    let factory = context
+        .session_config()
+        .get_split_runtime_factory()
+        .or_else(|| local_runtime_factory.cloned())
+        .ok_or_else(|| {
+            DataFusionError::Internal(
+                "no SplitRuntimeFactory registered on session config; \
+                 remote split execution requires config.set_split_runtime_factory(...)"
+                    .into(),
+            )
+        })?;
+    factory
+        .resolve_fast_field_schema(&split.descriptor, Arc::clone(requested_schema), prepared)
+        .await
+}
+
 fn split_needs_warmup(split: &SplitExecutionPlan) -> bool {
     split.needs_warmup
+}
+
+fn spawn_single_table_open_task(
+    input: SingleTableOpenInput,
+    tx: BatchSender,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(err) = run_single_table_open_task(input, tx.clone()).await {
+            let _ = tx.send(Err(err)).await;
+        }
+    })
+}
+
+async fn run_single_table_open_task(input: SingleTableOpenInput, tx: BatchSender) -> Result<()> {
+    let prepared = prepare_split(
+        &input.split,
+        input.local_runtime_factory.as_ref(),
+        input.context.as_ref(),
+    )
+    .await?;
+    let source_ff_schema = resolve_split_fast_field_schema(
+        &input.split,
+        &input.ff_projected_schema,
+        Arc::clone(&prepared),
+        input.local_runtime_factory.as_ref(),
+        input.context.as_ref(),
+    )
+    .await?;
+    debug!(
+        split_id = %input.split.descriptor.split_id,
+        source_fast_field_schema = ?source_ff_schema,
+        projected_fast_field_schema = ?input.ff_projected_schema,
+        "planning split fast-field projection"
+    );
+    let fast_field_projection =
+        plan_fast_field_projection(&source_ff_schema, &input.ff_projected_schema)?;
+
+    if input.needs_warmup {
+        warmup_single_table_split(
+            Arc::clone(&input.warmup_done),
+            SingleTableWarmupInput {
+                searcher: prepared.searcher().clone(),
+                tantivy_schema: prepared.index().schema(),
+                source_ff_schema: source_ff_schema.clone(),
+                raw_queries: input.raw_queries.clone(),
+                raw_not_queries: input.raw_not_queries.clone(),
+                raw_query_groups: input.raw_query_groups.clone(),
+                fast_field_filter_exprs: input.fast_field_filter_exprs.clone(),
+            },
+        )
+        .await?;
+    }
+
+    let scan_input = BlockingScanInput {
+        sync_pool: input.sync_pool,
+        prepared,
+        batch_size: input.batch_size,
+        source_ff_schema,
+        fast_field_projection,
+        unified_schema: input.unified_schema,
+        projection: input.projection,
+        score_column_idx: input.score_column_idx,
+        document_column_idx: input.document_column_idx,
+        needs_score: input.needs_score,
+        needs_document: input.needs_document,
+        topk: input.topk,
+        row_limit: input.row_limit,
+        raw_queries: input.raw_queries,
+        raw_not_queries: input.raw_not_queries,
+        raw_query_groups: input.raw_query_groups,
+        fast_field_filter_exprs: input.fast_field_filter_exprs,
+        pre_built_query: input.pre_built_query,
+        cancelled: input.cancelled,
+        projected_schema: input.projected_schema,
+    };
+    run_blocking_scan_and_forward(scan_input, tx).await
+}
+
+async fn warmup_single_table_split(
+    warmup_done: Arc<tokio::sync::OnceCell<()>>,
+    input: SingleTableWarmupInput,
+) -> Result<()> {
+    warmup_done
+        .get_or_try_init(|| async move {
+            let mut ff_names: std::collections::BTreeSet<String> = input
+                .source_ff_schema
+                .fields()
+                .iter()
+                .filter_map(|field| {
+                    let name = field.name();
+                    if name == "_doc_id" || name == "_segment_ord" {
+                        None
+                    } else {
+                        Some(crate::fast_field_read_name(field).to_string())
+                    }
+                })
+                .collect();
+            ff_names.extend(crate::warmup::fast_field_filter_field_names(
+                &input.tantivy_schema,
+                &input.fast_field_filter_exprs,
+            )?);
+
+            if !ff_names.is_empty() {
+                let ff_names: Vec<String> = ff_names.into_iter().collect();
+                let ff_name_refs: Vec<&str> = ff_names.iter().map(String::as_str).collect();
+                crate::warmup::warmup_fast_fields_by_name(&input.searcher, &ff_name_refs).await?;
+            }
+
+            let queried_fields: Vec<tantivy::schema::Field> = input
+                .raw_queries
+                .iter()
+                .chain(input.raw_not_queries.iter())
+                .chain(input.raw_query_groups.iter().flatten())
+                .filter_map(|(field_name, _)| input.tantivy_schema.get_field(field_name).ok())
+                .collect();
+            if !queried_fields.is_empty() {
+                crate::warmup::warmup_inverted_index(&input.searcher, &queried_fields).await?;
+            }
+
+            Ok::<(), DataFusionError>(())
+        })
+        .await
+        .map(|_| ())
+}
+
+async fn run_blocking_scan_and_forward(input: BlockingScanInput, tx: BatchSender) -> Result<()> {
+    let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
+    let BlockingScanInput {
+        sync_pool,
+        prepared,
+        batch_size,
+        source_ff_schema,
+        fast_field_projection,
+        unified_schema,
+        projection,
+        score_column_idx,
+        document_column_idx,
+        needs_score,
+        needs_document,
+        topk,
+        row_limit,
+        raw_queries,
+        raw_not_queries,
+        raw_query_groups,
+        fast_field_filter_exprs,
+        pre_built_query,
+        cancelled,
+        projected_schema,
+    } = input;
+    let prepared_for_docs = Arc::clone(&prepared);
+    let output_schema_for_docs = projected_schema;
+    let tantivy_schema = prepared_for_docs.index().schema();
+
+    let blocking_handle = tokio::spawn(async move {
+        sync_pool
+            .run_boxed(Box::new(move || {
+                let split_fast_field_query = match pre_built_query {
+                    Some(query) => Some(query),
+                    None => build_split_fast_field_query(
+                        &fast_field_filter_exprs,
+                        &prepared.index().schema(),
+                    ),
+                };
+                let query = build_combined_query(
+                    prepared.index(),
+                    split_fast_field_query.as_ref(),
+                    &raw_queries,
+                    &raw_not_queries,
+                    &raw_query_groups,
+                )?;
+                let cfg = ScanConfig {
+                    prepared,
+                    batch_size,
+                    source_ff_schema,
+                    fast_field_projection,
+                    unified_schema,
+                    projection,
+                    score_column_idx,
+                    document_column_idx,
+                    needs_score,
+                    needs_document,
+                    topk,
+                    row_limit,
+                    query,
+                    cancelled,
+                };
+                generate_single_table_batch_streaming(&cfg, |batch| {
+                    raw_tx.blocking_send(Ok(batch)).is_ok()
+                })?;
+                Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+            }))
+            .await
+    });
+
+    while let Some(result) = raw_rx.recv().await {
+        let to_send = match result {
+            Ok(batch) if needs_document => {
+                fill_document_column_async(
+                    batch,
+                    &prepared_for_docs,
+                    &output_schema_for_docs,
+                    &tantivy_schema,
+                )
+                .await
+            }
+            other => other,
+        };
+        if tx.send(to_send).await.is_err() {
+            break;
+        }
+    }
+
+    match blocking_handle.await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(DataFusionError::Internal(format!(
+            "sync pool task join: {e}"
+        ))),
+    }
 }
 
 impl DataSource for SingleTableDataSource {
@@ -985,210 +1464,13 @@ impl DataSource for SingleTableDataSource {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let metrics_guard = MetricsGuard(BaselineMetrics::new(&self.metrics, partition));
-        let batch_size = context.session_config().batch_size();
-        let sync_pool = crate::sync_exec::get_or_default_pool(context.as_ref());
-        let partition_spec = *self.partition_map.get(partition).ok_or_else(|| {
-            DataFusionError::Internal(format!("invalid partition index {partition}"))
-        })?;
-        let split = self
-            .splits
-            .get(partition_spec.split_idx)
-            .ok_or_else(|| DataFusionError::Internal("invalid split index".to_string()))?
-            .clone();
-        let raw_queries = self.raw_queries.clone();
-        let ff_projected_schema = self.schema.ff_projected.clone();
-        let unified_schema = self.schema.unified.clone();
-        let projected_schema = self.schema.projected.clone();
-        let projection = self.schema.projection.clone();
-        let needs_score = self.schema.needs_score;
-        let needs_document = self.schema.needs_document;
-        let score_column_idx = self.schema.score_idx;
-        let document_column_idx = self.schema.document_idx;
-        let topk = self.topk;
-        let pre_built_query = if self.splits.len() == 1 {
-            self.pre_built_query
-                .as_ref()
-                .map(|q| Arc::from(q.box_clone()))
-        } else {
-            None
-        };
-        let local_runtime_factory = self.local_runtime_factory.clone();
-        let fast_field_filter_exprs = self.fast_field_filter_exprs.clone();
-        let warmup_done = Arc::clone(
-            self.warmup_done
-                .get(partition_spec.split_idx)
-                .ok_or_else(|| DataFusionError::Internal("invalid warmup split index".into()))?,
-        );
-        let needs_warmup = split_needs_warmup(&split);
-        let row_limit = self.row_limit;
-        let cancelled = Arc::new(AtomicBool::new(false));
-
         let schema = self.schema.projected.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
-
-        let cancelled_task = Arc::clone(&cancelled);
-        let handle = tokio::spawn(async move {
-            let prepared =
-                match prepare_split(&split, local_runtime_factory.as_ref(), context.as_ref()).await
-                {
-                    Ok(prepared) => prepared,
-                    Err(err) => {
-                        let _ = tx.send(Err(err)).await;
-                        return;
-                    }
-                };
-
-            let source_ff_schema = tantivy_schema_to_arrow_with_multi_valued(
-                &split.descriptor.tantivy_schema,
-                &split.descriptor.multi_valued_fields,
-            );
-            let fast_field_projection =
-                match plan_fast_field_projection(&source_ff_schema, &ff_projected_schema) {
-                    Ok(plan) => plan,
-                    Err(err) => {
-                        let _ = tx.send(Err(err)).await;
-                        return;
-                    }
-                };
-
-            if needs_warmup {
-                let searcher = prepared.searcher().clone();
-                let tantivy_schema = prepared.index().schema();
-                let source_ff_schema = source_ff_schema.clone();
-                let raw_queries = raw_queries.clone();
-                let fast_field_filter_exprs = fast_field_filter_exprs.clone();
-                if let Err(err) = warmup_done
-                    .get_or_try_init(|| async move {
-                        let mut ff_names: std::collections::BTreeSet<String> = source_ff_schema
-                            .fields()
-                            .iter()
-                            .filter_map(|field| {
-                                let name = field.name();
-                                if name == "_doc_id" || name == "_segment_ord" {
-                                    None
-                                } else {
-                                    tantivy_schema
-                                        .get_field(name)
-                                        .ok()
-                                        .map(|_| name.to_string())
-                                }
-                            })
-                            .collect();
-                        ff_names.extend(crate::warmup::fast_field_filter_field_names(
-                            &tantivy_schema,
-                            &fast_field_filter_exprs,
-                        )?);
-
-                        if !ff_names.is_empty() {
-                            let ff_names: Vec<String> = ff_names.into_iter().collect();
-                            let ff_name_refs: Vec<&str> =
-                                ff_names.iter().map(String::as_str).collect();
-                            crate::warmup::warmup_fast_fields_by_name(&searcher, &ff_name_refs)
-                                .await?;
-                        }
-
-                        let queried_fields: Vec<tantivy::schema::Field> = raw_queries
-                            .iter()
-                            .filter_map(|(field_name, _)| tantivy_schema.get_field(field_name).ok())
-                            .collect();
-                        if !queried_fields.is_empty() {
-                            crate::warmup::warmup_inverted_index(&searcher, &queried_fields)
-                                .await?;
-                        }
-
-                        Ok::<(), DataFusionError>(())
-                    })
-                    .await
-                {
-                    let _ = tx.send(Err(err)).await;
-                    return;
-                }
-            }
-
-            // Blocking batch generation — batches exclude _document. When
-            // needs_document, the async loop below adds it via doc_async.
-            let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
-            let prepared_for_docs = Arc::clone(&prepared);
-            let output_schema_for_docs = projected_schema.clone();
-            let cancelled_blocking = Arc::clone(&cancelled_task);
-
-            let blocking_handle = tokio::spawn(async move {
-                sync_pool.run_boxed(Box::new(move || {
-                    let split_fast_field_query = match pre_built_query {
-                        Some(query) => Some(query),
-                        None => build_split_fast_field_query(
-                            &fast_field_filter_exprs,
-                            &prepared.index().schema(),
-                        ),
-                    };
-                    let query = build_combined_query(
-                        prepared.index(),
-                        split_fast_field_query.as_ref(),
-                        &raw_queries,
-                    )?;
-                    let cfg = ScanConfig {
-                        prepared,
-                        batch_size,
-                        source_ff_schema,
-                        fast_field_projection,
-                        unified_schema,
-                        projection,
-                        score_column_idx,
-                        document_column_idx,
-                        needs_score,
-                        needs_document,
-                        topk,
-                        row_limit,
-                        query,
-                        cancelled: cancelled_blocking,
-                    };
-                    generate_single_table_batch_streaming(&cfg, |batch| {
-                        raw_tx.blocking_send(Ok(batch)).is_ok()
-                    })?;
-                    Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
-                })).await
-            });
-
-            // Forward batches, adding _document column async when needed.
-            let tantivy_schema = prepared_for_docs.index().schema();
-            while let Some(result) = raw_rx.recv().await {
-                let to_send = match result {
-                    Ok(batch) if needs_document => {
-                        fill_document_column_async(
-                            batch,
-                            &prepared_for_docs,
-                            &output_schema_for_docs,
-                            &tantivy_schema,
-                        )
-                        .await
-                    }
-                    other => other,
-                };
-                if tx.send(to_send).await.is_err() {
-                    break;
-                }
-            }
-
-            // Propagate errors from the pool task.
-            match blocking_handle.await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    let _ = tx.send(Err(e)).await;
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(DataFusionError::Internal(format!(
-                            "sync pool task join: {e}"
-                        ))))
-                        .await;
-                }
-            }
-        });
+        let input = self.open_input(partition, context, Arc::clone(&cancelled))?;
+        let handle = spawn_single_table_open_task(input, tx);
         let guard = AbortOnDrop { handle, cancelled };
 
-        // Convert receiver to stream with metrics tracking.
-        // The guard is owned by the stream — when the stream is dropped, the
-        // spawned task is aborted, preventing leaked background work.
         let stream = futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
             rx.recv().await.map(|batch| (batch, (rx, guard)))
         });
@@ -1422,7 +1704,7 @@ async fn fill_document_column_async(
 // ---------------------------------------------------------------------------
 
 /// Holds immutable context for assembling one `RecordBatch` from a chunk of
-/// doc_ids + optional scores. Created once per segment and reused for every
+/// `doc_ids` plus optional scores. Created once per segment and reused for every
 /// chunk, avoiding 14-parameter function signatures.
 struct ChunkBuilder<'a> {
     segment_reader: &'a tantivy::SegmentReader,
@@ -1438,8 +1720,8 @@ struct ChunkBuilder<'a> {
     dict_cache: DictCache,
 }
 
-impl<'a> ChunkBuilder<'a> {
-    /// Assemble a `RecordBatch` from a chunk of doc_ids and optional scores.
+impl ChunkBuilder<'_> {
+    /// Assemble a `RecordBatch` from a chunk of `doc_ids` and optional scores.
     ///
     /// Produces fast fields and scores only — `_document` is excluded here and
     /// added asynchronously by `fill_document_column_async` after this batch
@@ -1508,7 +1790,8 @@ impl<'a> ChunkBuilder<'a> {
             if unified_idx == self.document_column_idx {
                 // Skip _document — it's added async after the sync execution pool.
                 continue;
-            } else if unified_idx == self.score_column_idx {
+            }
+            if unified_idx == self.score_column_idx {
                 output_columns.push(score_array.clone().unwrap_or_else(|| {
                     arrow::array::new_null_array(&DataType::Float32, chunk_rows)
                 }));
@@ -1567,11 +1850,6 @@ fn generate_single_table_batch_streaming(
     cfg: &ScanConfig,
     mut emit: impl FnMut(RecordBatch) -> bool,
 ) -> Result<()> {
-    let index = cfg.prepared.index();
-    let batch_size = cfg.batch_size;
-    let needs_score = cfg.needs_score;
-    let searcher = cfg.prepared.searcher();
-
     let projected_indices: Vec<usize> = match &cfg.projection {
         Some(indices) => indices.clone(),
         None => (0..cfg.unified_schema.fields().len()).collect(),
@@ -1580,121 +1858,214 @@ fn generate_single_table_batch_streaming(
 
     if let Some(topk) = cfg.topk {
         let effective_topk = remaining.min(topk);
-        if effective_topk == 0 {
-            return Ok(());
-        }
-        let query = cfg.query.as_ref().ok_or_else(|| {
-            DataFusionError::Internal("topk collection requires an active query".into())
-        })?;
-        let hits = searcher
-            .search(
-                query.as_ref(),
-                &TopDocs::with_limit(effective_topk).order_by_score(),
-            )
-            .map_err(|e| DataFusionError::Internal(format!("topk search: {e}")))?;
-        if hits.is_empty() {
-            return Ok(());
-        }
+        return emit_topk_batches(cfg, &projected_indices, effective_topk, &mut emit);
+    }
 
-        let mut grouped: std::collections::BTreeMap<u32, Vec<(u32, f32, usize)>> =
-            std::collections::BTreeMap::new();
-        for (original_pos, (score, doc_addr)) in hits.into_iter().enumerate() {
-            grouped.entry(doc_addr.segment_ord).or_default().push((
-                doc_addr.doc_id,
-                score,
-                original_pos,
-            ));
-        }
+    emit_segment_scan_batches(cfg, &projected_indices, &mut remaining, &mut emit)
+}
 
-        let mut segment_batches = Vec::new();
-        let mut take_positions = vec![0u32; effective_topk];
-        let mut concat_offset = 0usize;
+fn build_chunk_builder<'a>(
+    cfg: &'a ScanConfig,
+    segment_reader: &'a tantivy::SegmentReader,
+    segment_ord: u32,
+    projected_indices: &[usize],
+    dict_cache: DictCache,
+) -> ChunkBuilder<'a> {
+    ChunkBuilder {
+        segment_reader,
+        source_ff_schema: &cfg.source_ff_schema,
+        fast_field_projection: &cfg.fast_field_projection,
+        unified_schema: &cfg.unified_schema,
+        projected_indices: projected_indices.to_vec(),
+        score_column_idx: cfg.score_column_idx,
+        document_column_idx: cfg.document_column_idx,
+        needs_score: cfg.needs_score,
+        needs_document: cfg.needs_document,
+        segment_ord,
+        dict_cache,
+    }
+}
 
-        for (segment_ord, rows) in grouped {
-            let segment_reader = searcher.segment_reader(segment_ord);
-            let dict_cache = DictCache::build(segment_reader, &cfg.source_ff_schema)?;
-            let builder = ChunkBuilder {
-                segment_reader,
-                source_ff_schema: &cfg.source_ff_schema,
-                fast_field_projection: &cfg.fast_field_projection,
-                unified_schema: &cfg.unified_schema,
-                projected_indices: projected_indices.clone(),
-                score_column_idx: cfg.score_column_idx,
-                document_column_idx: cfg.document_column_idx,
-                needs_score,
-                needs_document: cfg.needs_document,
-                segment_ord,
-                dict_cache,
-            };
-            let mut doc_ids = Vec::with_capacity(rows.len());
-            let mut scores = Vec::with_capacity(rows.len());
-            for (local_idx, (doc_id, score, original_pos)) in rows.into_iter().enumerate() {
-                doc_ids.push(doc_id);
-                scores.push(score);
-                take_positions[original_pos] = (concat_offset + local_idx) as u32;
-            }
-            let batch = builder.build(&doc_ids, Some(&scores))?;
-            concat_offset += batch.num_rows();
-            segment_batches.push(batch);
-        }
+fn emit_topk_batches(
+    cfg: &ScanConfig,
+    projected_indices: &[usize],
+    effective_topk: usize,
+    emit: &mut impl FnMut(RecordBatch) -> bool,
+) -> Result<()> {
+    if effective_topk == 0 {
+        return Ok(());
+    }
+    if effective_topk > u32::MAX as usize {
+        return Err(DataFusionError::Internal(format!(
+            "topk {effective_topk} exceeds UInt32 take index capacity"
+        )));
+    }
 
-        let reordered = if segment_batches.len() == 1 {
-            segment_batches.pop().unwrap()
-        } else {
-            let schema = segment_batches
-                .first()
-                .map(RecordBatch::schema)
-                .ok_or_else(|| DataFusionError::Internal("missing topk batches".into()))?;
-            let concatenated = concat_batches(&schema, &segment_batches)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            let take_indices = UInt32Array::from_iter_values(take_positions.iter().copied());
-            let columns: Vec<ArrayRef> = concatenated
-                .columns()
-                .iter()
-                .map(|column| {
-                    take(column.as_ref(), &take_indices, None)
-                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-                })
-                .collect::<Result<_>>()?;
-            RecordBatch::try_new(concatenated.schema(), columns)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
-        };
-
-        let total_rows = reordered.num_rows();
-        let mut offset = 0usize;
-        while offset < total_rows {
-            if cfg.cancelled.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            let len = (total_rows - offset).min(batch_size);
-            let batch = reordered.slice(offset, len);
-            if batch.num_rows() > 0 && !emit(batch) {
-                return Ok(());
-            }
-            offset += len;
-        }
+    let query = cfg.query.as_ref().ok_or_else(|| {
+        DataFusionError::Internal("topk collection requires an active query".into())
+    })?;
+    let hits = cfg
+        .prepared
+        .searcher()
+        .search(
+            query.as_ref(),
+            &TopDocs::with_limit(effective_topk).order_by_score(),
+        )
+        .map_err(|e| DataFusionError::Internal(format!("topk search: {e}")))?;
+    if hits.is_empty() {
         return Ok(());
     }
 
+    let (segment_batches, take_positions) = build_topk_segment_batches(
+        cfg,
+        projected_indices,
+        group_topk_hits(hits),
+        effective_topk,
+    )?;
+    let reordered = reorder_topk_batches(segment_batches, &take_positions)?;
+    emit_sliced_batch(&reordered, cfg.batch_size, cfg.cancelled.as_ref(), emit)
+}
+
+fn group_topk_hits(
+    hits: Vec<(f32, tantivy::DocAddress)>,
+) -> std::collections::BTreeMap<u32, Vec<(u32, f32, usize)>> {
+    let mut grouped: std::collections::BTreeMap<u32, Vec<(u32, f32, usize)>> =
+        std::collections::BTreeMap::new();
+    for (original_pos, (score, doc_addr)) in hits.into_iter().enumerate() {
+        grouped.entry(doc_addr.segment_ord).or_default().push((
+            doc_addr.doc_id,
+            score,
+            original_pos,
+        ));
+    }
+    grouped
+}
+
+fn build_topk_segment_batches(
+    cfg: &ScanConfig,
+    projected_indices: &[usize],
+    grouped: std::collections::BTreeMap<u32, Vec<(u32, f32, usize)>>,
+    effective_topk: usize,
+) -> Result<(Vec<RecordBatch>, Vec<u32>)> {
+    let mut segment_batches = Vec::new();
+    let mut take_positions = vec![0u32; effective_topk];
+    let mut concat_offset = 0usize;
+
+    for (segment_ord, rows) in grouped {
+        let segment_reader = cfg.prepared.searcher().segment_reader(segment_ord);
+        let dict_cache = DictCache::build(segment_reader, &cfg.source_ff_schema)?;
+        let builder = build_chunk_builder(
+            cfg,
+            segment_reader,
+            segment_ord,
+            projected_indices,
+            dict_cache,
+        );
+        let (doc_ids, scores) =
+            collect_topk_rows(rows, concat_offset, take_positions.as_mut_slice())?;
+        let batch = builder.build(&doc_ids, Some(&scores))?;
+        concat_offset += batch.num_rows();
+        segment_batches.push(batch);
+    }
+
+    Ok((segment_batches, take_positions))
+}
+
+fn collect_topk_rows(
+    rows: Vec<(u32, f32, usize)>,
+    concat_offset: usize,
+    take_positions: &mut [u32],
+) -> Result<(Vec<u32>, Vec<f32>)> {
+    let mut doc_ids = Vec::with_capacity(rows.len());
+    let mut scores = Vec::with_capacity(rows.len());
+    for (local_idx, (doc_id, score, original_pos)) in rows.into_iter().enumerate() {
+        doc_ids.push(doc_id);
+        scores.push(score);
+        take_positions[original_pos] = u32::try_from(concat_offset + local_idx).map_err(|_| {
+            DataFusionError::Internal(
+                "topk concatenated row offset exceeds UInt32 take index capacity".into(),
+            )
+        })?;
+    }
+    Ok((doc_ids, scores))
+}
+
+fn reorder_topk_batches(
+    mut segment_batches: Vec<RecordBatch>,
+    take_positions: &[u32],
+) -> Result<RecordBatch> {
+    if segment_batches.len() == 1 {
+        return segment_batches
+            .pop()
+            .ok_or_else(|| DataFusionError::Internal("missing topk batch".into()));
+    }
+
+    let schema = segment_batches
+        .first()
+        .map(RecordBatch::schema)
+        .ok_or_else(|| DataFusionError::Internal("missing topk batches".into()))?;
+    let concatenated = concat_batches(&schema, &segment_batches)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let take_indices = UInt32Array::from_iter_values(take_positions.iter().copied());
+    let columns: Vec<ArrayRef> = concatenated
+        .columns()
+        .iter()
+        .map(|column| {
+            take(column.as_ref(), &take_indices, None)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        })
+        .collect::<Result<_>>()?;
+    RecordBatch::try_new(concatenated.schema(), columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+fn emit_sliced_batch(
+    batch: &RecordBatch,
+    batch_size: usize,
+    cancelled: &AtomicBool,
+    emit: &mut impl FnMut(RecordBatch) -> bool,
+) -> Result<()> {
+    let total_rows = batch.num_rows();
+    let mut offset = 0usize;
+    while offset < total_rows {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let len = (total_rows - offset).min(batch_size);
+        let batch = batch.slice(offset, len);
+        if batch.num_rows() > 0 && !emit(batch) {
+            return Ok(());
+        }
+        offset += len;
+    }
+    Ok(())
+}
+
+fn emit_segment_scan_batches(
+    cfg: &ScanConfig,
+    projected_indices: &[usize],
+    remaining: &mut usize,
+    emit: &mut impl FnMut(RecordBatch) -> bool,
+) -> Result<()> {
+    let index = cfg.prepared.index();
+    let searcher = cfg.prepared.searcher();
+
     for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
-        if remaining == 0 || cfg.cancelled.load(Ordering::Relaxed) {
+        if *remaining == 0 || cfg.cancelled.load(Ordering::Relaxed) {
             break;
         }
 
         let dict_cache = DictCache::build(segment_reader, &cfg.source_ff_schema)?;
-        let builder = ChunkBuilder {
+        let segment_ord = u32::try_from(segment_ord).map_err(|_| {
+            DataFusionError::Internal(format!("segment ordinal {segment_ord} exceeds u32"))
+        })?;
+        let builder = build_chunk_builder(
+            cfg,
             segment_reader,
-            source_ff_schema: &cfg.source_ff_schema,
-            fast_field_projection: &cfg.fast_field_projection,
-            unified_schema: &cfg.unified_schema,
-            projected_indices: projected_indices.clone(),
-            score_column_idx: cfg.score_column_idx,
-            document_column_idx: cfg.document_column_idx,
-            needs_score,
-            needs_document: cfg.needs_document,
-            segment_ord: segment_ord as u32,
+            segment_ord,
+            projected_indices,
             dict_cache,
-        };
+        );
 
         for_each_matching_doc_chunks(
             MatchingDocChunksConfig {
@@ -1702,25 +2073,25 @@ fn generate_single_table_batch_streaming(
                 searcher,
                 query: cfg.query.as_ref(),
                 index_schema: &index.schema(),
-                needs_score,
-                batch_size,
+                needs_score: cfg.needs_score,
+                batch_size: cfg.batch_size,
                 cancelled: cfg.cancelled.as_ref(),
             },
             |chunk_ids, chunk_scores| {
-                if remaining == 0 || cfg.cancelled.load(Ordering::Relaxed) {
+                if *remaining == 0 || cfg.cancelled.load(Ordering::Relaxed) {
                     return Ok(false);
                 }
 
-                let take = remaining.min(chunk_ids.len());
+                let take = (*remaining).min(chunk_ids.len());
                 let batch = builder.build(
                     &chunk_ids[..take],
                     chunk_scores.map(|scores| &scores[..take]),
                 )?;
-                remaining -= take;
+                *remaining -= take;
                 if batch.num_rows() > 0 && !emit(batch) {
                     return Ok(false);
                 }
-                Ok(remaining > 0)
+                Ok(*remaining > 0)
             },
         )?;
     }
@@ -1744,6 +2115,24 @@ fn logical_expr_to_tantivy_query(
         return None;
     };
 
+    match binary.op {
+        Operator::And => {
+            let left = logical_expr_to_tantivy_query(binary.left.as_ref(), tantivy_schema)?;
+            let right = logical_expr_to_tantivy_query(binary.right.as_ref(), tantivy_schema)?;
+            return Some(Box::new(tantivy::query::BooleanQuery::intersection(vec![
+                left, right,
+            ])));
+        }
+        Operator::Or => {
+            let left = logical_expr_to_tantivy_query(binary.left.as_ref(), tantivy_schema)?;
+            let right = logical_expr_to_tantivy_query(binary.right.as_ref(), tantivy_schema)?;
+            return Some(Box::new(tantivy::query::BooleanQuery::union(vec![
+                left, right,
+            ])));
+        }
+        _ => {}
+    }
+
     let (col_name, scalar, col_on_left) = match (binary.left.as_ref(), binary.right.as_ref()) {
         (Expr::Column(col), Expr::Literal(sv, _)) => (col.name.clone(), sv.clone(), true),
         (Expr::Literal(sv, _), Expr::Column(col)) => (col.name.clone(), sv.clone(), false),
@@ -1759,7 +2148,7 @@ fn logical_expr_to_tantivy_query(
     let op = if col_on_left {
         binary.op
     } else {
-        logical_flip_operator(&binary.op)?
+        logical_flip_operator(binary.op)?
     };
 
     let term = logical_scalar_to_term(field, field_entry.field_type(), &scalar)?;
@@ -1812,7 +2201,7 @@ fn logical_expr_to_tantivy_query(
 }
 
 /// Flip a comparison operator when the column is on the right side.
-fn logical_flip_operator(op: &Operator) -> Option<Operator> {
+fn logical_flip_operator(op: Operator) -> Option<Operator> {
     match op {
         Operator::Eq => Some(Operator::Eq),
         Operator::NotEq => Some(Operator::NotEq),
@@ -1841,6 +2230,7 @@ fn logical_scalar_to_term(
                 ScalarValue::UInt32(Some(v)) => i64::from(*v),
                 ScalarValue::UInt16(Some(v)) => i64::from(*v),
                 ScalarValue::UInt8(Some(v)) => i64::from(*v),
+                ScalarValue::TimestampMillisecond(Some(v), _) => *v,
                 ScalarValue::Float64(Some(v)) => {
                     if v.fract() != 0.0 || *v > i64::MAX as f64 || *v < i64::MIN as f64 {
                         return None;
@@ -1874,15 +2264,15 @@ fn logical_scalar_to_term(
         FieldType::F64(_) => {
             let v = match scalar {
                 ScalarValue::Float64(Some(v)) => *v,
-                ScalarValue::Float32(Some(v)) => *v as f64,
+                ScalarValue::Float32(Some(v)) => f64::from(*v),
                 ScalarValue::Int64(Some(v)) => *v as f64,
-                ScalarValue::Int32(Some(v)) => *v as f64,
-                ScalarValue::Int16(Some(v)) => *v as f64,
-                ScalarValue::Int8(Some(v)) => *v as f64,
+                ScalarValue::Int32(Some(v)) => f64::from(*v),
+                ScalarValue::Int16(Some(v)) => f64::from(*v),
+                ScalarValue::Int8(Some(v)) => f64::from(*v),
                 ScalarValue::UInt64(Some(v)) => *v as f64,
-                ScalarValue::UInt32(Some(v)) => *v as f64,
-                ScalarValue::UInt16(Some(v)) => *v as u64 as f64,
-                ScalarValue::UInt8(Some(v)) => *v as f64,
+                ScalarValue::UInt32(Some(v)) => f64::from(*v),
+                ScalarValue::UInt16(Some(v)) => f64::from(*v),
+                ScalarValue::UInt8(Some(v)) => f64::from(*v),
                 _ => return None,
             };
             return Some(Term::from_field_f64(field, v));
@@ -1960,7 +2350,7 @@ pub(crate) fn serialize_fast_field_filters(exprs: &[Expr]) -> Result<String> {
             let op = if col_on_left {
                 binary.op
             } else {
-                logical_flip_operator(&binary.op)?
+                logical_flip_operator(binary.op)?
             };
             let op_str = match op {
                 Operator::Eq => "eq",
@@ -2010,7 +2400,7 @@ pub(crate) fn deserialize_fast_field_filters(
             other => {
                 return Err(DataFusionError::Internal(format!(
                     "unknown fast field filter op: {other}"
-                )))
+                )));
             }
         };
         let expr = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
@@ -2054,7 +2444,7 @@ pub(crate) fn deserialize_fast_field_filter_exprs(json: &str) -> Result<Vec<Expr
                 other => {
                     return Err(DataFusionError::Internal(format!(
                         "unknown fast field filter op: {other}"
-                    )))
+                    )));
                 }
             };
 
@@ -2188,9 +2578,14 @@ fn json_pair_to_scalar(value: &str, value_type: &str) -> Result<ScalarValue> {
 
 #[cfg(test)]
 mod tests {
-    use super::{json_pair_to_scalar, scalar_to_json_pair};
+    use super::{
+        analyze_fast_field_filter_support, json_pair_to_scalar, logical_expr_to_tantivy_query,
+        logical_scalar_to_term, scalar_to_json_pair, FilterPushdownSupport,
+    };
     use datafusion::common::ScalarValue;
+    use datafusion::prelude::{col, lit};
     use std::sync::Arc;
+    use tantivy::schema::{Schema as TantivySchema, FAST, INDEXED, STRING};
 
     #[test]
     fn test_timestamp_scalar_json_roundtrip_preserves_timezone() {
@@ -2200,5 +2595,36 @@ mod tests {
         let decoded = json_pair_to_scalar(&value, &tag).unwrap();
 
         assert_eq!(decoded, scalar);
+    }
+
+    #[test]
+    fn i64_fast_field_accepts_timestamp_millis_filter_literal() {
+        let mut builder = TantivySchema::builder();
+        let field = builder.add_i64_field("timestamp", FAST | INDEXED);
+        let schema = builder.build();
+        let field_type = schema.get_field_entry(field).field_type();
+
+        assert!(logical_scalar_to_term(
+            field,
+            field_type,
+            &ScalarValue::TimestampMillisecond(Some(1_779_287_400_123), None),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn ored_string_fast_field_filters_build_union_query() {
+        let mut builder = TantivySchema::builder();
+        builder.add_text_field("__encoded_id__", STRING | FAST);
+        let schema = builder.build();
+        let expr = col("__encoded_id__")
+            .eq(lit("event-1"))
+            .or(col("__encoded_id__").eq(lit("event-2")));
+
+        assert_eq!(
+            analyze_fast_field_filter_support(&expr, &schema),
+            FilterPushdownSupport::Query
+        );
+        assert!(logical_expr_to_tantivy_query(&expr, &schema).is_some());
     }
 }

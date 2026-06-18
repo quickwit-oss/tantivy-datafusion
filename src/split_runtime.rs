@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
@@ -11,12 +12,13 @@ use tantivy::{Index, IndexReader, ReloadPolicy, Searcher};
 ///
 /// `payload` is intentionally opaque to `tantivy-datafusion`. Integrations such
 /// as Quickwit can encode whatever worker-local reconstruction data they need.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SplitDescriptor {
     pub split_id: String,
     pub payload: Vec<u8>,
     pub tantivy_schema: tantivy::schema::Schema,
     pub multi_valued_fields: Vec<String>,
+    pub fast_field_schema: Option<SchemaRef>,
 }
 
 impl SplitDescriptor {
@@ -31,7 +33,33 @@ impl SplitDescriptor {
             payload,
             tantivy_schema,
             multi_valued_fields,
+            fast_field_schema: None,
         }
+    }
+
+    pub fn new_with_fast_field_schema(
+        split_id: impl Into<String>,
+        payload: Vec<u8>,
+        tantivy_schema: tantivy::schema::Schema,
+        multi_valued_fields: Vec<String>,
+        fast_field_schema: SchemaRef,
+    ) -> Self {
+        Self {
+            split_id: split_id.into(),
+            payload,
+            tantivy_schema,
+            multi_valued_fields,
+            fast_field_schema: Some(fast_field_schema),
+        }
+    }
+
+    pub fn fast_field_schema(&self) -> SchemaRef {
+        self.fast_field_schema.clone().unwrap_or_else(|| {
+            crate::schema_mapping::tantivy_schema_to_arrow_with_multi_valued(
+                &self.tantivy_schema,
+                &self.multi_valued_fields,
+            )
+        })
     }
 }
 
@@ -97,6 +125,15 @@ impl PreparedSplit {
 #[async_trait]
 pub trait SplitRuntimeFactory: Send + Sync {
     async fn prepare_split(&self, descriptor: &SplitDescriptor) -> Result<Arc<PreparedSplit>>;
+
+    async fn resolve_fast_field_schema(
+        &self,
+        descriptor: &SplitDescriptor,
+        _requested_schema: SchemaRef,
+        _prepared: Arc<PreparedSplit>,
+    ) -> Result<SchemaRef> {
+        Ok(descriptor.fast_field_schema())
+    }
 }
 
 pub type SplitRuntimeFactoryRef = Arc<dyn SplitRuntimeFactory>;

@@ -374,6 +374,110 @@ async fn test_multi_split_single_table_roundtrip() {
 }
 
 #[tokio::test]
+async fn test_split_descriptor_fast_field_schema_roundtrip() {
+    let index = create_int_score_index(0);
+    let tantivy_schema = index.schema();
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("_doc_id", DataType::UInt32, false),
+        Field::new("_segment_ord", DataType::UInt32, false),
+        Field::new(
+            "custom.mixed",
+            DataType::new_list(DataType::Int64, true),
+            true,
+        ),
+    ]));
+    let canonical_schema = Arc::new(Schema::new(vec![
+        Field::new("_doc_id", DataType::UInt32, false),
+        Field::new("_segment_ord", DataType::UInt32, false),
+        Field::new(
+            "custom.mixed",
+            DataType::new_list(DataType::Utf8, true),
+            true,
+        ),
+    ]));
+    let descriptor = SplitDescriptor::new_with_fast_field_schema(
+        "split-with-dynamic-schema",
+        Vec::new(),
+        tantivy_schema,
+        Vec::new(),
+        source_schema,
+    );
+    let provider = SingleTableProvider::from_split_descriptors_with_fast_field_schema(
+        vec![descriptor],
+        canonical_schema,
+    )
+    .unwrap();
+
+    let session = SessionContext::new();
+    let state = session.state();
+    let exec = provider.scan(&state, None, &[], None).await.unwrap();
+
+    let mut split_indices = HashMap::new();
+    split_indices.insert("split-with-dynamic-schema".to_string(), index);
+    let decode_session = session_with_named_openers(split_indices);
+
+    let codec = TantivyCodec;
+    let mut buf = Vec::new();
+    codec.try_encode(exec, &mut buf).unwrap();
+    let decoded = codec
+        .try_decode(&buf, &[], &decode_session.state().task_ctx())
+        .unwrap();
+    let decoded_descriptor = single_table_ds(&decoded).split_descriptors().remove(0);
+    let decoded_schema = decoded_descriptor.fast_field_schema();
+
+    assert_eq!(
+        decoded_schema
+            .field_with_name("custom.mixed")
+            .unwrap()
+            .data_type(),
+        &DataType::new_list(DataType::Int64, true)
+    );
+}
+
+#[tokio::test]
+async fn test_split_descriptor_without_fast_field_schema_roundtrip() {
+    let index = create_int_score_index(0);
+    let tantivy_schema = index.schema();
+    let canonical_schema = Arc::new(Schema::new(vec![
+        Field::new("_doc_id", DataType::UInt32, false),
+        Field::new("_segment_ord", DataType::UInt32, false),
+        Field::new("score", DataType::Float64, true),
+    ]));
+    let descriptor = SplitDescriptor::new(
+        "split-with-worker-resolved-schema",
+        Vec::new(),
+        tantivy_schema,
+        Vec::new(),
+    );
+    let provider = SingleTableProvider::from_split_descriptors_with_fast_field_schema(
+        vec![descriptor],
+        canonical_schema,
+    )
+    .unwrap();
+
+    let session = SessionContext::new();
+    let state = session.state();
+    let exec = provider.scan(&state, None, &[], None).await.unwrap();
+
+    let mut split_indices = HashMap::new();
+    split_indices.insert("split-with-worker-resolved-schema".to_string(), index);
+    let decode_session = session_with_named_openers(split_indices);
+
+    let codec = TantivyCodec;
+    let mut buf = Vec::new();
+    codec.try_encode(exec, &mut buf).unwrap();
+    let decoded = codec
+        .try_decode(&buf, &[], &decode_session.state().task_ctx())
+        .unwrap();
+    let decoded_descriptor = single_table_ds(&decoded).split_descriptors().remove(0);
+
+    assert!(
+        decoded_descriptor.fast_field_schema.is_none(),
+        "split-local schemas should not be embedded in descriptors when worker resolution is used"
+    );
+}
+
+#[tokio::test]
 async fn test_double_roundtrip_single_table() {
     let index = create_test_index();
     let provider = SingleTableProvider::new(index.clone());

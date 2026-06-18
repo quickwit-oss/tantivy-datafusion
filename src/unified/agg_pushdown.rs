@@ -96,7 +96,7 @@ fn try_rewrite(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Execu
             Ok(try_rewrite_single(agg, &plan))
         }
         AggregateMode::Final | AggregateMode::FinalPartitioned => try_rewrite_two_phase(agg, &plan),
-        AggregateMode::Partial => {
+        AggregateMode::Partial | AggregateMode::PartialReduce => {
             // Partial on its own — not the top-level, skip
             Ok(Transformed::no(plan))
         }

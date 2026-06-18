@@ -2,9 +2,18 @@ use std::any::Any;
 
 use arrow::datatypes::DataType;
 use datafusion::common::{Result, ScalarValue};
-use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::expr::{BinaryExpr, ScalarFunction};
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::logical_expr::{Expr, ScalarFunctionArgs, ScalarUDF, Signature, Volatility};
+use datafusion::logical_expr::{
+    Expr, Operator, ScalarFunctionArgs, ScalarUDF, Signature, Volatility,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullTextFilter {
+    pub field_name: String,
+    pub query_string: String,
+    pub negated: bool,
+}
 
 /// A marker UDF for full-text search predicates.
 ///
@@ -106,4 +115,57 @@ pub fn extract_full_text_call(expr: &Expr) -> Option<(String, String)> {
     } else {
         None
     }
+}
+
+/// Extract a full-text filter, including a top-level NOT around the call.
+pub fn extract_full_text_filter(expr: &Expr) -> Option<FullTextFilter> {
+    if let Some((field_name, query_string)) = extract_full_text_call(expr) {
+        return Some(FullTextFilter {
+            field_name,
+            query_string,
+            negated: false,
+        });
+    }
+
+    if let Expr::Not(inner) = expr {
+        let (field_name, query_string) = extract_full_text_call(inner)?;
+        return Some(FullTextFilter {
+            field_name,
+            query_string,
+            negated: true,
+        });
+    }
+
+    None
+}
+
+/// Extract a disjunction of `full_text(column, query)` calls.
+///
+/// A bare `full_text(...)` returns a one-element group. An OR tree of
+/// full-text calls returns one entry per disjunct. Anything mixed with another
+/// expression returns `None`.
+pub fn extract_full_text_or_group(expr: &Expr) -> Option<Vec<(String, String)>> {
+    let mut group = Vec::new();
+    collect_full_text_disjunction(expr, &mut group)?;
+    Some(group)
+}
+
+fn collect_full_text_disjunction(expr: &Expr, group: &mut Vec<(String, String)>) -> Option<()> {
+    if let Some(call) = extract_full_text_call(expr) {
+        group.push(call);
+        return Some(());
+    }
+
+    if let Expr::BinaryExpr(BinaryExpr {
+        left,
+        op: Operator::Or,
+        right,
+    }) = expr
+    {
+        collect_full_text_disjunction(left, group)?;
+        collect_full_text_disjunction(right, group)?;
+        return Some(());
+    }
+
+    None
 }

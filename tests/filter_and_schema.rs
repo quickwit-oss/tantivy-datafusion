@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray, RecordBatch};
-use arrow::datatypes::{DataType, Field, Float64Type, Schema, UInt64Type};
+use arrow::array::{Array, AsArray, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema, UInt64Type};
 use datafusion::prelude::*;
-use tantivy::schema::{SchemaBuilder, FAST, STORED, TEXT};
+use tantivy::schema::{
+    IndexRecordOption, SchemaBuilder, TextFieldIndexing, TextOptions, FAST, STORED, TEXT,
+};
 use tantivy::{Index, IndexWriter, TantivyDocument};
 use tantivy_datafusion::fast_field_reader::read_segment_fast_fields_to_batch;
-use tantivy_datafusion::{full_text_udf, SingleTableProvider};
+use tantivy_datafusion::{full_text_udf, SingleTableProvider, FAST_FIELD_READ_NAME_METADATA_KEY};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -363,6 +365,110 @@ fn test_null_padding_multiple_missing_types() {
         let col = batch.column(col_idx);
         assert_eq!(col.null_count(), 3, "column {col_idx} should be all nulls");
     }
+}
+
+#[test]
+fn test_fast_field_read_name_metadata_aliases_physical_field() {
+    let mut builder = SchemaBuilder::new();
+    let mixed_field = builder.add_i64_field("mixed", FAST);
+    let schema = builder.build();
+
+    let index = Index::create_in_ram(schema);
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+
+    let mut doc = TantivyDocument::default();
+    doc.add_i64(mixed_field, 42);
+    writer.add_document(doc).unwrap();
+    writer.commit().unwrap();
+
+    let reader = index.reader().unwrap();
+    let searcher = reader.searcher();
+    let segment_reader = &searcher.segment_readers()[0];
+    let projected_schema = Arc::new(Schema::new(vec![Field::new(
+        "mixed__qw_lane_00_i64",
+        DataType::Int64,
+        true,
+    )
+    .with_metadata(std::collections::HashMap::from([(
+        FAST_FIELD_READ_NAME_METADATA_KEY.to_string(),
+        "mixed".to_string(),
+    )]))]));
+
+    let batch = read_segment_fast_fields_to_batch(
+        segment_reader,
+        &projected_schema,
+        None,
+        None,
+        None,
+        0,
+        None,
+    )
+    .unwrap();
+    let values = batch.column(0).as_primitive::<Int64Type>();
+
+    assert_eq!(values.value(0), 42);
+}
+
+#[test]
+fn test_utf8_projection_reads_scalar_string_fast_field() {
+    let mut builder = SchemaBuilder::new();
+    let raw_options = TextOptions::default()
+        .set_stored()
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("default")
+                .set_index_option(IndexRecordOption::Basic),
+        )
+        .set_fast(Some("raw"));
+    let raw_field = builder.add_text_field("__raw__", raw_options);
+    let schema = builder.build();
+
+    let index = Index::create_in_ram(schema);
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+
+    for raw in [
+        r#"{"message":"worker started","service":"retriever"}"#,
+        r#"{"message":"query failed","service":"api"}"#,
+    ] {
+        let mut doc = TantivyDocument::default();
+        doc.add_text(raw_field, raw);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().unwrap();
+
+    let reader = index.reader().unwrap();
+    let searcher = reader.searcher();
+    let segment_reader = &searcher.segment_readers()[0];
+    let projected_schema = Arc::new(Schema::new(vec![Field::new(
+        "__raw__",
+        DataType::Utf8,
+        true,
+    )]));
+
+    let batch = read_segment_fast_fields_to_batch(
+        segment_reader,
+        &projected_schema,
+        None,
+        None,
+        None,
+        0,
+        None,
+    )
+    .unwrap();
+    let values = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(
+        values.value(0),
+        r#"{"message":"worker started","service":"retriever"}"#
+    );
+    assert_eq!(
+        values.value(1),
+        r#"{"message":"query failed","service":"api"}"#
+    );
 }
 
 /// SQL-level test: UNION two SingleTableProviders with different schemas.

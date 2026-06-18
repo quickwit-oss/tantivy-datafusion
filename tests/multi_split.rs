@@ -268,6 +268,50 @@ async fn test_multi_split_full_text_ignores_splits_missing_field() {
 }
 
 #[tokio::test]
+async fn test_multi_split_full_text_all_missing_field_matches_zero_rows() {
+    let provider =
+        SingleTableProvider::from_local_splits(vec![create_missing_score_split()]).unwrap();
+
+    let config = SessionConfig::new().with_target_partitions(4);
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_udf(full_text_udf());
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    let df = ctx
+        .sql("SELECT id FROM t WHERE full_text('missing_category', 'books')")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+
+    assert_eq!(total_rows, 0);
+}
+
+#[tokio::test]
+async fn test_multi_split_full_text_or_group_all_missing_fields_matches_zero_rows() {
+    let provider =
+        SingleTableProvider::from_local_splits(vec![create_missing_score_split()]).unwrap();
+
+    let config = SessionConfig::new().with_target_partitions(4);
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_udf(full_text_udf());
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    let df = ctx
+        .sql(
+            "SELECT id FROM t \
+             WHERE full_text('missing_category', 'books') \
+                OR full_text('also_missing', 'electronics')",
+        )
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+
+    assert_eq!(total_rows, 0);
+}
+
+#[tokio::test]
 async fn test_multi_split_partition_count_matches_split_count() {
     let mut builder = SchemaBuilder::new();
     let id = builder.add_u64_field("id", FAST | STORED);

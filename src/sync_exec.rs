@@ -95,9 +95,7 @@ impl SyncExecutionPoolExt for SessionConfig {
 
 /// Retrieve the sync execution pool from a task context, falling back to
 /// [`SpawnBlockingPool`] if none was injected.
-pub fn get_or_default_pool(
-    context: &datafusion::execution::TaskContext,
-) -> SyncExecutionPoolRef {
+pub fn get_or_default_pool(context: &datafusion::execution::TaskContext) -> SyncExecutionPoolRef {
     context
         .session_config()
         .get_sync_execution_pool()

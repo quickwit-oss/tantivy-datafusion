@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow::array::{
+    ArrayRef, BooleanBuilder, Float64Array, Float64Builder, Int64Array, Int64Builder, ListBuilder,
+    RecordBatch, StringBuilder, UInt64Array, UInt64Builder,
+};
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
@@ -349,32 +352,37 @@ fn terms_bucket_to_batch(
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    let row_count = buckets.len();
 
     for field in schema.fields() {
         let col_name = field.name().as_str();
 
         if is_group_key_column(col_name, agg_def) {
-            // Bucket key column
-            let values: Vec<Option<String>> = buckets
-                .iter()
-                .map(|b| Some(key_to_string(&b.key)))
-                .collect();
-            columns.push(cast_key_column(&values, field.data_type()));
+            columns.push(key_column_from_iter(
+                buckets.iter().map(|bucket| Some(&bucket.key)),
+                row_count,
+                field.data_type(),
+            ));
         } else if is_doc_count_column(col_name, &agg_def.sub_aggregation) {
             // doc_count: maps to the bucket's document count.
             // Matches explicit "doc_count" or COUNT(*) columns (e.g.
             // "count(Int64(1))") that have no corresponding sub-aggregation.
-            let values: Vec<i64> = buckets.iter().map(|b| b.doc_count as i64).collect();
-            columns.push(Arc::new(Int64Array::from(values)));
+            columns.push(doc_count_column(
+                buckets.iter().map(|bucket| bucket.doc_count),
+                row_count,
+            )?);
         } else {
-            // Sub-aggregation metric column
-            let values: Vec<Option<f64>> = buckets
-                .iter()
-                .map(|b| {
-                    extract_sub_agg_value(&b.sub_aggregation, col_name, &agg_def.sub_aggregation)
-                })
-                .collect();
-            columns.push(typed_f64_column(&values, field.data_type()));
+            columns.push(typed_f64_column_from_iter(
+                buckets.iter().map(|bucket| {
+                    extract_sub_agg_value(
+                        &bucket.sub_aggregation,
+                        col_name,
+                        &agg_def.sub_aggregation,
+                    )
+                }),
+                row_count,
+                field.data_type(),
+            ));
         }
     }
 
@@ -394,30 +402,31 @@ fn terms_bucket_to_partial_state_batch(
     }
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    let key_values: Vec<Option<String>> = buckets
-        .iter()
-        .map(|bucket| Some(key_to_string(&bucket.key)))
-        .collect();
-    columns.push(cast_key_column(&key_values, schema.fields()[0].data_type()));
+    let row_count = buckets.len();
+    columns.push(key_column_from_iter(
+        buckets.iter().map(|bucket| Some(&bucket.key)),
+        row_count,
+        schema.fields()[0].data_type(),
+    ));
 
     for field in schema.fields().iter().skip(1) {
         let col_name = field.name().as_str();
         if is_doc_count_column(col_name, &agg_def.sub_aggregation) {
-            let values: Vec<Option<f64>> = buckets
-                .iter()
-                .map(|bucket| Some(bucket.doc_count as f64))
-                .collect();
-            columns.push(typed_f64_column(&values, field.data_type()));
+            columns.push(typed_f64_column_from_iter(
+                buckets.iter().map(|bucket| Some(bucket.doc_count as f64)),
+                row_count,
+                field.data_type(),
+            ));
             continue;
         }
 
-        let values: Vec<Option<f64>> = buckets
-            .iter()
-            .map(|bucket| {
+        columns.push(typed_f64_column_from_iter(
+            buckets.iter().map(|bucket| {
                 extract_sub_agg_value(&bucket.sub_aggregation, col_name, &agg_def.sub_aggregation)
-            })
-            .collect();
-        columns.push(typed_f64_column(&values, field.data_type()));
+            }),
+            row_count,
+            field.data_type(),
+        ));
     }
 
     RecordBatch::try_new(schema.clone(), columns)
@@ -430,24 +439,34 @@ fn histogram_bucket_to_batch(
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    let row_count = buckets.len();
 
     for field in schema.fields() {
         let col_name = field.name().as_str();
 
         if col_name == "bucket" {
-            let values: Vec<Option<f64>> = buckets.iter().map(|b| key_to_f64(&b.key)).collect();
-            columns.push(Arc::new(Float64Array::from(values)));
+            columns.push(typed_f64_column_from_iter(
+                buckets.iter().map(|bucket| key_to_f64(&bucket.key)),
+                row_count,
+                field.data_type(),
+            ));
         } else if is_doc_count_column(col_name, &agg_def.sub_aggregation) {
-            let values: Vec<i64> = buckets.iter().map(|b| b.doc_count as i64).collect();
-            columns.push(Arc::new(Int64Array::from(values)));
+            columns.push(doc_count_column(
+                buckets.iter().map(|bucket| bucket.doc_count),
+                row_count,
+            )?);
         } else {
-            let values: Vec<Option<f64>> = buckets
-                .iter()
-                .map(|b| {
-                    extract_sub_agg_value(&b.sub_aggregation, col_name, &agg_def.sub_aggregation)
-                })
-                .collect();
-            columns.push(typed_f64_column(&values, field.data_type()));
+            columns.push(typed_f64_column_from_iter(
+                buckets.iter().map(|bucket| {
+                    extract_sub_agg_value(
+                        &bucket.sub_aggregation,
+                        col_name,
+                        &agg_def.sub_aggregation,
+                    )
+                }),
+                row_count,
+                field.data_type(),
+            ));
         }
     }
 
@@ -461,27 +480,34 @@ fn range_bucket_to_batch(
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    let row_count = buckets.len();
 
     for field in schema.fields() {
         let col_name = field.name().as_str();
 
         if col_name == "bucket" {
-            let values: Vec<Option<String>> = buckets
-                .iter()
-                .map(|bucket| Some(key_as_str(&bucket.key).to_string()))
-                .collect();
-            columns.push(cast_key_column(&values, field.data_type()));
+            columns.push(string_key_column_from_iter(
+                buckets.iter().map(|bucket| Some(key_as_str(&bucket.key))),
+                row_count,
+                field.data_type(),
+            ));
         } else if is_doc_count_column(col_name, &agg_def.sub_aggregation) {
-            let values: Vec<i64> = buckets.iter().map(|b| b.doc_count as i64).collect();
-            columns.push(Arc::new(Int64Array::from(values)));
+            columns.push(doc_count_column(
+                buckets.iter().map(|bucket| bucket.doc_count),
+                row_count,
+            )?);
         } else {
-            let values: Vec<Option<f64>> = buckets
-                .iter()
-                .map(|b| {
-                    extract_sub_agg_value(&b.sub_aggregation, col_name, &agg_def.sub_aggregation)
-                })
-                .collect();
-            columns.push(typed_f64_column(&values, field.data_type()));
+            columns.push(typed_f64_column_from_iter(
+                buckets.iter().map(|bucket| {
+                    extract_sub_agg_value(
+                        &bucket.sub_aggregation,
+                        col_name,
+                        &agg_def.sub_aggregation,
+                    )
+                }),
+                row_count,
+                field.data_type(),
+            ));
         }
     }
 
@@ -527,21 +553,43 @@ fn is_group_key_column(col_name: &str, agg_def: &Aggregation) -> bool {
     }
 }
 
-fn key_to_string(key: &Key) -> String {
-    match key {
-        Key::Str(s) => s.clone(),
-        Key::F64(v) => v.to_string(),
-        Key::I64(v) => v.to_string(),
-        Key::U64(v) => v.to_string(),
-    }
-}
-
 fn key_to_f64(key: &Key) -> Option<f64> {
     match key {
         Key::F64(v) => Some(*v),
         Key::I64(v) => Some(*v as f64),
         Key::U64(v) => Some(*v as f64),
-        Key::Str(_) => None,
+        Key::Str(s) => s.parse::<f64>().ok(),
+    }
+}
+
+fn key_to_i64(key: &Key) -> Option<i64> {
+    match key {
+        Key::I64(v) => Some(*v),
+        Key::U64(v) => i64::try_from(*v).ok(),
+        Key::F64(v) if v.fract() == 0.0 && *v >= i64::MIN as f64 && *v <= i64::MAX as f64 => {
+            Some(*v as i64)
+        }
+        Key::F64(_) => None,
+        Key::Str(s) => s.parse::<i64>().ok(),
+    }
+}
+
+fn key_to_u64(key: &Key) -> Option<u64> {
+    match key {
+        Key::U64(v) => Some(*v),
+        Key::I64(v) => u64::try_from(*v).ok(),
+        Key::F64(v) if v.fract() == 0.0 && *v >= 0.0 && *v <= u64::MAX as f64 => Some(*v as u64),
+        Key::F64(_) => None,
+        Key::Str(s) => s.parse::<u64>().ok(),
+    }
+}
+
+fn key_to_bool(key: &Key) -> Option<bool> {
+    match key {
+        Key::Str(s) => Some(s == "true" || s == "1"),
+        Key::I64(v) => Some(*v == 1),
+        Key::U64(v) => Some(*v == 1),
+        Key::F64(v) => Some(*v == 1.0),
     }
 }
 
@@ -552,65 +600,273 @@ fn key_as_str(key: &Key) -> &str {
     }
 }
 
-/// Cast string key values to the target data type.
-fn cast_key_column(values: &[Option<String>], data_type: &DataType) -> ArrayRef {
-    let string_arr: ArrayRef = Arc::new(StringArray::from(
-        values.iter().map(|v| v.as_deref()).collect::<Vec<_>>(),
-    ));
-    match data_type {
-        DataType::Utf8 => string_arr,
-        DataType::Utf8View => arrow::compute::cast(&string_arr, data_type).unwrap_or(string_arr),
-        DataType::Dictionary(_, _) => {
-            // Produce a Dictionary<Int32, Utf8> array matching the schema
-            arrow::compute::cast(&string_arr, data_type).unwrap_or(string_arr)
-        }
-        DataType::Float64 => {
-            let nums: Vec<Option<f64>> = values
-                .iter()
-                .map(|v| v.as_ref().and_then(|s| s.parse::<f64>().ok()))
-                .collect();
-            Arc::new(Float64Array::from(nums))
-        }
-        DataType::Int64 => {
-            let nums: Vec<Option<i64>> = values
-                .iter()
-                .map(|v| v.as_ref().and_then(|s| s.parse::<i64>().ok()))
-                .collect();
-            Arc::new(Int64Array::from(nums))
-        }
-        DataType::UInt64 => {
-            let nums: Vec<Option<u64>> = values
-                .iter()
-                .map(|v| v.as_ref().and_then(|s| s.parse::<u64>().ok()))
-                .collect();
-            Arc::new(UInt64Array::from(nums))
-        }
-        DataType::Boolean => {
-            let bools: Vec<Option<bool>> = values
-                .iter()
-                .map(|v| v.as_ref().map(|s| s == "true" || s == "1"))
-                .collect();
-            Arc::new(arrow::array::BooleanArray::from(bools))
-        }
-        // Fallback: produce string
-        _ => string_arr,
+fn append_key_string(builder: &mut StringBuilder, key: &Key) {
+    match key {
+        Key::Str(s) => builder.append_value(s),
+        Key::F64(v) => builder.append_value(v.to_string()),
+        Key::I64(v) => builder.append_value(v.to_string()),
+        Key::U64(v) => builder.append_value(v.to_string()),
     }
 }
 
-/// Create a typed column from f64 values, casting to the target data type.
-fn typed_f64_column(values: &[Option<f64>], data_type: &DataType) -> ArrayRef {
+fn key_string_array_from_iter<'a>(
+    values: impl Iterator<Item = Option<&'a Key>>,
+    row_count: usize,
+) -> ArrayRef {
+    let mut builder = StringBuilder::with_capacity(row_count, row_count * 16);
+    for value in values {
+        match value {
+            Some(key) => append_key_string(&mut builder, key),
+            None => builder.append_null(),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn string_array_from_iter<'a>(
+    values: impl Iterator<Item = Option<&'a str>>,
+    row_count: usize,
+) -> ArrayRef {
+    let mut builder = StringBuilder::with_capacity(row_count, row_count * 16);
+    for value in values {
+        match value {
+            Some(value) => builder.append_value(value),
+            None => builder.append_null(),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn key_column_from_iter<'a>(
+    values: impl Iterator<Item = Option<&'a Key>>,
+    row_count: usize,
+    data_type: &DataType,
+) -> ArrayRef {
     match data_type {
-        DataType::Float64 => Arc::new(Float64Array::from(values.to_vec())),
+        DataType::Utf8 => key_string_array_from_iter(values, row_count),
+        DataType::Utf8View => {
+            let string_arr = key_string_array_from_iter(values, row_count);
+            arrow::compute::cast(&string_arr, data_type).unwrap_or(string_arr)
+        }
+        DataType::Dictionary(_, _) => {
+            let string_arr = key_string_array_from_iter(values, row_count);
+            arrow::compute::cast(&string_arr, data_type).unwrap_or(string_arr)
+        }
+        DataType::List(inner)
+            if matches!(inner.data_type(), DataType::Utf8 | DataType::Utf8View) =>
+        {
+            let list_arr = keys_to_list(values, row_count, inner);
+            if list_arr.data_type() == data_type {
+                list_arr
+            } else {
+                arrow::compute::cast(&list_arr, data_type).unwrap_or(list_arr)
+            }
+        }
+        DataType::Float64 => {
+            let mut builder = Float64Builder::with_capacity(row_count);
+            for value in values {
+                append_optional_f64(&mut builder, value.and_then(key_to_f64));
+            }
+            Arc::new(builder.finish())
+        }
         DataType::Int64 => {
-            let ints: Vec<Option<i64>> = values.iter().map(|v| v.map(|f| f as i64)).collect();
-            Arc::new(Int64Array::from(ints))
+            let mut builder = Int64Builder::with_capacity(row_count);
+            for value in values {
+                append_optional_i64(&mut builder, value.and_then(key_to_i64));
+            }
+            Arc::new(builder.finish())
         }
         DataType::UInt64 => {
-            let uints: Vec<Option<u64>> = values.iter().map(|v| v.map(|f| f as u64)).collect();
-            Arc::new(UInt64Array::from(uints))
+            let mut builder = UInt64Builder::with_capacity(row_count);
+            for value in values {
+                append_optional_u64(&mut builder, value.and_then(key_to_u64));
+            }
+            Arc::new(builder.finish())
         }
-        // Fallback
-        _ => Arc::new(Float64Array::from(values.to_vec())),
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::with_capacity(row_count);
+            for value in values {
+                append_optional_bool(&mut builder, value.and_then(key_to_bool));
+            }
+            Arc::new(builder.finish())
+        }
+        _ => key_string_array_from_iter(values, row_count),
+    }
+}
+
+fn string_key_column_from_iter<'a>(
+    values: impl Iterator<Item = Option<&'a str>>,
+    row_count: usize,
+    data_type: &DataType,
+) -> ArrayRef {
+    match data_type {
+        DataType::Utf8 => string_array_from_iter(values, row_count),
+        DataType::Utf8View => {
+            let string_arr = string_array_from_iter(values, row_count);
+            arrow::compute::cast(&string_arr, data_type).unwrap_or(string_arr)
+        }
+        DataType::Dictionary(_, _) => {
+            let string_arr = string_array_from_iter(values, row_count);
+            arrow::compute::cast(&string_arr, data_type).unwrap_or(string_arr)
+        }
+        DataType::List(inner)
+            if matches!(inner.data_type(), DataType::Utf8 | DataType::Utf8View) =>
+        {
+            let list_arr = strings_to_list(values, row_count, inner);
+            if list_arr.data_type() == data_type {
+                list_arr
+            } else {
+                arrow::compute::cast(&list_arr, data_type).unwrap_or(list_arr)
+            }
+        }
+        DataType::Float64 => {
+            let mut builder = Float64Builder::with_capacity(row_count);
+            for value in values {
+                append_optional_f64(&mut builder, value.and_then(|s| s.parse::<f64>().ok()));
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Int64 => {
+            let mut builder = Int64Builder::with_capacity(row_count);
+            for value in values {
+                append_optional_i64(&mut builder, value.and_then(|s| s.parse::<i64>().ok()));
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::UInt64 => {
+            let mut builder = UInt64Builder::with_capacity(row_count);
+            for value in values {
+                append_optional_u64(&mut builder, value.and_then(|s| s.parse::<u64>().ok()));
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::with_capacity(row_count);
+            for value in values {
+                append_optional_bool(&mut builder, value.map(|s| s == "true" || s == "1"));
+            }
+            Arc::new(builder.finish())
+        }
+        _ => string_array_from_iter(values, row_count),
+    }
+}
+
+fn keys_to_list<'a>(
+    values: impl Iterator<Item = Option<&'a Key>>,
+    row_count: usize,
+    item_field: &Arc<arrow::datatypes::Field>,
+) -> ArrayRef {
+    let mut builder = ListBuilder::new(StringBuilder::with_capacity(row_count, row_count * 16));
+    if matches!(item_field.data_type(), DataType::Utf8) {
+        builder = builder.with_field(Arc::clone(item_field));
+    }
+
+    for value in values {
+        match value {
+            Some(key) => {
+                append_key_string(builder.values(), key);
+                builder.append(true);
+            }
+            None => builder.append(false),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn strings_to_list<'a>(
+    values: impl Iterator<Item = Option<&'a str>>,
+    row_count: usize,
+    item_field: &Arc<arrow::datatypes::Field>,
+) -> ArrayRef {
+    let mut builder = ListBuilder::new(StringBuilder::with_capacity(row_count, row_count * 16));
+    if matches!(item_field.data_type(), DataType::Utf8) {
+        builder = builder.with_field(Arc::clone(item_field));
+    }
+
+    for value in values {
+        match value {
+            Some(value) => {
+                builder.values().append_value(value);
+                builder.append(true);
+            }
+            None => builder.append(false),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn doc_count_column(counts: impl Iterator<Item = u64>, row_count: usize) -> Result<ArrayRef> {
+    let mut builder = Int64Builder::with_capacity(row_count);
+    for count in counts {
+        let count = i64::try_from(count)
+            .map_err(|_| DataFusionError::Internal(format!("doc_count {count} exceeds i64")))?;
+        builder.append_value(count);
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn append_optional_f64(builder: &mut Float64Builder, value: Option<f64>) {
+    match value {
+        Some(value) => builder.append_value(value),
+        None => builder.append_null(),
+    }
+}
+
+fn append_optional_i64(builder: &mut Int64Builder, value: Option<i64>) {
+    match value {
+        Some(value) => builder.append_value(value),
+        None => builder.append_null(),
+    }
+}
+
+fn append_optional_u64(builder: &mut UInt64Builder, value: Option<u64>) {
+    match value {
+        Some(value) => builder.append_value(value),
+        None => builder.append_null(),
+    }
+}
+
+fn append_optional_bool(builder: &mut BooleanBuilder, value: Option<bool>) {
+    match value {
+        Some(value) => builder.append_value(value),
+        None => builder.append_null(),
+    }
+}
+
+fn typed_f64_column_from_iter(
+    values: impl Iterator<Item = Option<f64>>,
+    row_count: usize,
+    data_type: &DataType,
+) -> ArrayRef {
+    match data_type {
+        DataType::Float64 => {
+            let mut builder = Float64Builder::with_capacity(row_count);
+            for value in values {
+                append_optional_f64(&mut builder, value);
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Int64 => {
+            let mut builder = Int64Builder::with_capacity(row_count);
+            for value in values {
+                append_optional_i64(&mut builder, value.map(|f| f as i64));
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::UInt64 => {
+            let mut builder = UInt64Builder::with_capacity(row_count);
+            for value in values {
+                append_optional_u64(&mut builder, value.map(|f| f as u64));
+            }
+            Arc::new(builder.finish())
+        }
+        _ => {
+            let mut builder = Float64Builder::with_capacity(row_count);
+            for value in values {
+                append_optional_f64(&mut builder, value);
+            }
+            Arc::new(builder.finish())
+        }
     }
 }
 
@@ -677,11 +933,39 @@ fn extract_stats_metric_value(metric: &MetricResult, suffix: &str) -> Option<f64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Array, ListArray, StringArray};
 
     #[test]
     fn cast_key_column_respects_utf8_view_schema() {
-        let values = vec![Some("api".to_string()), Some("web".to_string())];
-        let array = cast_key_column(&values, &DataType::Utf8View);
+        let values = [Some("api".to_string()), Some("web".to_string())];
+        let array = string_key_column_from_iter(
+            values.iter().map(|value| value.as_deref()),
+            values.len(),
+            &DataType::Utf8View,
+        );
         assert_eq!(array.data_type(), &DataType::Utf8View);
+    }
+
+    #[test]
+    fn cast_key_column_wraps_strings_for_list_schema() {
+        let values = [Some("api".to_string()), None, Some("web".to_string())];
+        let data_type = DataType::new_list(DataType::Utf8, true);
+        let array = string_key_column_from_iter(
+            values.iter().map(|value| value.as_deref()),
+            values.len(),
+            &data_type,
+        );
+        assert_eq!(array.data_type(), &data_type);
+
+        let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+        let strings = list
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(list.value_offsets(), &[0, 1, 1, 2]);
+        assert_eq!(strings.value(0), "api");
+        assert!(list.is_null(1));
+        assert_eq!(strings.value(1), "web");
     }
 }

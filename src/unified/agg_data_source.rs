@@ -165,6 +165,10 @@ fn split_needs_warmup(split: &AggSplitPlan) -> bool {
     split.needs_warmup
 }
 
+fn empty_batch_stream(schema: SchemaRef) -> SendableRecordBatchStream {
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream::empty()))
+}
+
 impl AggDataSource {
     pub fn new(
         index: tantivy::Index,
@@ -411,6 +415,10 @@ impl AggDataSource {
             .collect()
     }
 
+    pub(crate) fn split_descriptor_refs(&self) -> impl Iterator<Item = &SplitDescriptor> + '_ {
+        self.splits.iter().map(|split| &split.descriptor)
+    }
+
     pub fn local_runtime_factory(&self) -> Option<SplitRuntimeFactoryRef> {
         self.local_runtime_factory.clone()
     }
@@ -457,16 +465,10 @@ impl DataSource for AggDataSource {
         let schema = self.output_schema.clone();
         match self.output_mode {
             AggOutputMode::FinalMerged if partition != 0 => {
-                return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    schema,
-                    stream::empty(),
-                )));
+                return Ok(empty_batch_stream(schema));
             }
             AggOutputMode::PartialStates if partition >= self.splits.len() => {
-                return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    schema,
-                    stream::empty(),
-                )));
+                return Ok(empty_batch_stream(schema));
             }
             _ => {}
         }
@@ -813,6 +815,8 @@ async fn execute_split_intermediate_agg(
             prepared.index(),
             split_fast_field_query.as_ref(),
             &raw_queries,
+            &[],
+            &[],
         )?;
         crate::unified::agg_exec::execute_tantivy_intermediate_agg_with_reader(
             prepared.index(),
@@ -865,6 +869,8 @@ async fn execute_single_split_agg_batch(
             prepared.index(),
             split_fast_field_query.as_ref(),
             &raw_queries,
+            &[],
+            &[],
         )?;
         crate::unified::agg_exec::execute_tantivy_agg_with_reader(
             prepared.index(),
@@ -918,6 +924,8 @@ async fn execute_single_split_partial_state_batch(
             prepared.index(),
             split_fast_field_query.as_ref(),
             &raw_queries,
+            &[],
+            &[],
         )?;
         let results = crate::unified::agg_exec::execute_tantivy_agg_results_with_reader(
             prepared.index(),

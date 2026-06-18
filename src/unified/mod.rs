@@ -3,7 +3,8 @@
 //! A single `DataSource` that handles FTS queries, fast field reading, scoring,
 //! document retrieval, and aggregations internally — no joins needed.
 //!
-//! Start reviewing here: [`SingleTableProvider`] is the entry point.
+//! Start reviewing here: [`single_table_provider::SingleTableProvider`] is the
+//! entry point.
 //!
 //! ## Rule Ordering
 //!

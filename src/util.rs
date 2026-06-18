@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
-use tantivy::query::{BooleanQuery, EnableScoring, QueryParser};
+use tantivy::query::{AllQuery, BooleanQuery, EnableScoring, QueryParser};
+use tantivy::query_grammar::Occur;
 use tantivy::{DocId, DocSet, Index, Score, Searcher, SegmentReader, TERMINATED};
 
 /// Combine pre-parsed queries with raw `(field_name, query_string)` pairs
@@ -19,31 +20,83 @@ pub(crate) fn build_combined_query(
     index: &Index,
     pre_parsed: Option<&Arc<dyn tantivy::query::Query>>,
     raw_queries: &[(String, String)],
+    raw_not_queries: &[(String, String)],
+    raw_query_groups: &[Vec<(String, String)>],
 ) -> Result<Option<Arc<dyn tantivy::query::Query>>> {
     let mut queries: Vec<Box<dyn tantivy::query::Query>> = Vec::new();
+    let mut not_queries: Vec<Box<dyn tantivy::query::Query>> = Vec::new();
 
     if let Some(q) = pre_parsed {
         queries.push(q.box_clone());
     }
 
-    let tantivy_schema = index.schema();
     for (field_name, query_string) in raw_queries {
-        let field = match tantivy_schema.get_field(field_name) {
-            Ok(field) => field,
-            Err(_) => return Ok(Some(Arc::new(tantivy::query::EmptyQuery))),
-        };
-        let parser = QueryParser::for_index(index, vec![field]);
-        let parsed = parser.parse_query(query_string).map_err(|e| {
-            DataFusionError::Plan(format!("full_text: failed to parse '{query_string}': {e}"))
-        })?;
-        queries.push(parsed);
+        match parse_raw_query(index, field_name, query_string)? {
+            Some(query) => queries.push(query),
+            None => return Ok(Some(Arc::new(tantivy::query::EmptyQuery))),
+        }
     }
 
-    match queries.len() {
-        0 => Ok(None),
-        1 => Ok(queries.into_iter().next().map(Arc::from)),
-        _ => Ok(Some(Arc::new(BooleanQuery::intersection(queries)))),
+    for (field_name, query_string) in raw_not_queries {
+        if let Some(query) = parse_raw_query(index, field_name, query_string)? {
+            not_queries.push(query);
+        }
     }
+
+    for group in raw_query_groups {
+        let mut disjuncts = Vec::new();
+        for (field_name, query_string) in group {
+            if let Some(query) = parse_raw_query(index, field_name, query_string)? {
+                disjuncts.push(query);
+            }
+        }
+        match disjuncts.len() {
+            0 => queries.push(Box::new(tantivy::query::EmptyQuery)),
+            1 => queries.push(disjuncts.pop().expect("single disjunct")),
+            _ => queries.push(Box::new(BooleanQuery::union(disjuncts))),
+        }
+    }
+
+    let positive: Option<Arc<dyn tantivy::query::Query>> = match queries.len() {
+        0 => None,
+        1 => queries.into_iter().next().map(|query| {
+            let query: Arc<dyn tantivy::query::Query> = Arc::from(query);
+            query
+        }),
+        _ => Some(Arc::new(BooleanQuery::intersection(queries))),
+    };
+
+    if not_queries.is_empty() {
+        return Ok(positive);
+    }
+
+    let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
+        Vec::with_capacity(1 + not_queries.len());
+    clauses.push((
+        Occur::Must,
+        positive.as_ref().map_or_else(
+            || Box::new(AllQuery) as Box<dyn tantivy::query::Query>,
+            |query| query.as_ref().box_clone(),
+        ),
+    ));
+    clauses.extend(not_queries.into_iter().map(|query| (Occur::MustNot, query)));
+    Ok(Some(Arc::new(BooleanQuery::from(clauses))))
+}
+
+fn parse_raw_query(
+    index: &Index,
+    field_name: &str,
+    query_string: &str,
+) -> Result<Option<Box<dyn tantivy::query::Query>>> {
+    let tantivy_schema = index.schema();
+    let field = match tantivy_schema.get_field(field_name) {
+        Ok(field) => field,
+        Err(_) => return Ok(None),
+    };
+    let parser = QueryParser::for_index(index, vec![field]);
+    parser.parse_query(query_string).map(Some).map_err(|e| {
+        DataFusionError::Plan(format!("full_text: failed to parse '{query_string}': {e}"))
+    })
 }
 
 fn flush_doc_buffer<F>(doc_buffer: &mut Vec<DocId>, on_chunk: &mut F) -> Result<bool>
@@ -104,7 +157,7 @@ where
         .scorer(segment_reader, 1.0)
         .map_err(|e| DataFusionError::Internal(format!("create scorer: {e}")))?;
     let mut ids = Vec::with_capacity(batch_size);
-    let mut scores = Vec::with_capacity(batch_size);
+    let mut score_buffer = Vec::with_capacity(batch_size);
     let mut doc = scorer.doc();
 
     while doc != TERMINATED {
@@ -113,16 +166,18 @@ where
         }
         if alive_bitset.is_none_or(|alive| alive.is_alive(doc)) {
             ids.push(doc);
-            scores.push(scorer.score());
+            score_buffer.push(scorer.score());
 
-            if ids.len() == batch_size && !flush_scored_buffer(&mut ids, &mut scores, on_chunk)? {
+            if ids.len() == batch_size
+                && !flush_scored_buffer(&mut ids, &mut score_buffer, on_chunk)?
+            {
                 return Ok(());
             }
         }
         doc = scorer.advance();
     }
 
-    flush_scored_buffer(&mut ids, &mut scores, on_chunk)?;
+    flush_scored_buffer(&mut ids, &mut score_buffer, on_chunk)?;
     Ok(())
 }
 

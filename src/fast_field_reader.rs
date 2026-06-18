@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, DictionaryArray, Float64Builder, Int32Builder,
-    Int64Builder, ListBuilder, StringArray, StringBuilder, TimestampMicrosecondBuilder,
-    UInt32Array, UInt64Builder,
+    ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, DictionaryArray, Float64Builder,
+    Int32Builder, Int64Builder, ListBuilder, StringArray, StringBuilder,
+    TimestampMicrosecondBuilder, UInt32Array, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -32,9 +32,10 @@ impl DictCache {
                 continue;
             }
             let name = field.name();
-            let str_col = match fast_fields.str(name) {
-                Ok(Some(col)) => col,
-                _ => continue, // missing field — null padding handles it
+            let read_name = crate::fast_field_read_name(field);
+            let Ok(Some(str_col)) = fast_fields.str(read_name) else {
+                // Missing field: null padding handles it.
+                continue;
             };
 
             let num_terms = str_col.num_terms();
@@ -55,12 +56,13 @@ impl DictCache {
     }
 
     /// Get the pre-built dictionary values for a field.
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&Arc<StringArray>> {
         self.entries.get(name)
     }
 }
 
-/// Reads fast fields from a single segment and produces an Arrow RecordBatch.
+/// Reads fast fields from a single segment and produces an Arrow `RecordBatch`.
 ///
 /// If `doc_ids` is `Some`, only those document IDs are read (already filtered by
 /// a tantivy query). If `None`, all alive (non-deleted) documents are read.
@@ -78,10 +80,9 @@ pub fn read_segment_fast_fields_to_batch(
 ) -> Result<RecordBatch> {
     let fast_fields = segment_reader.fast_fields();
     let docs_storage = collect_docs(segment_reader, doc_ids, doc_id_range, limit);
-    let docs: &[u32] = match &docs_storage {
-        Some(docs) => docs.as_slice(),
-        None => doc_ids.unwrap_or_default(),
-    };
+    let docs: &[u32] = docs_storage
+        .as_deref()
+        .unwrap_or_else(|| doc_ids.unwrap_or_default());
 
     let num_docs = docs.len();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(projected_schema.fields().len());
@@ -105,22 +106,20 @@ fn collect_docs(
     doc_id_range: Option<std::ops::Range<u32>>,
     limit: Option<usize>,
 ) -> Option<Vec<u32>> {
-    match doc_ids {
-        Some(_) => None,
-        None => {
-            let alive_bitset = segment_reader.alive_bitset();
-            let (start, end) = match doc_id_range {
-                Some(range) => (range.start, range.end),
-                None => (0, segment_reader.max_doc()),
-            };
-            let iter = (start..end)
-                .filter(|&doc_id| alive_bitset.map(|bs| bs.is_alive(doc_id)).unwrap_or(true));
-            Some(match limit {
-                Some(lim) => iter.take(lim).collect(),
-                None => iter.collect(),
-            })
-        }
+    if doc_ids.is_some() {
+        return None;
     }
+
+    let alive_bitset = segment_reader.alive_bitset();
+    let (start, end) = doc_id_range.map_or_else(
+        || (0, segment_reader.max_doc()),
+        |range| (range.start, range.end),
+    );
+    let iter = (start..end).filter(|&doc_id| alive_bitset.is_none_or(|bs| bs.is_alive(doc_id)));
+    Some(match limit {
+        Some(lim) => iter.take(lim).collect(),
+        None => iter.collect(),
+    })
 }
 
 fn build_internal_column(
@@ -146,21 +145,31 @@ fn build_fast_field_array(
     dict_cache: Option<&DictCache>,
 ) -> Result<ArrayRef> {
     let name = field.name();
+    let read_name = crate::fast_field_read_name(field);
     match field.data_type() {
-        DataType::UInt64 => build_u64_array(fast_fields, name, num_docs, docs),
-        DataType::Int64 => build_i64_array(fast_fields, name, num_docs, docs),
-        DataType::Float64 => build_f64_array(fast_fields, name, num_docs, docs),
-        DataType::Boolean => build_bool_array(fast_fields, name, num_docs, docs),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            build_timestamp_array(fast_fields, name, num_docs, docs)
-        }
-        DataType::Dictionary(_, _) => {
-            build_dictionary_array(fast_fields, field, name, num_docs, docs, dict_cache)
-        }
-        DataType::Utf8 => Ok(build_utf8_array(fast_fields, field, name, num_docs, docs)),
-        DataType::Binary => build_binary_array(fast_fields, field, name, num_docs, docs),
+        DataType::UInt64 => Ok(build_u64_array(fast_fields, read_name, num_docs, docs)),
+        DataType::Int64 => Ok(build_i64_array(fast_fields, read_name, num_docs, docs)),
+        DataType::Float64 => Ok(build_f64_array(fast_fields, read_name, num_docs, docs)),
+        DataType::Boolean => Ok(build_bool_array(fast_fields, read_name, num_docs, docs)),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => Ok(build_timestamp_array(
+            fast_fields,
+            read_name,
+            num_docs,
+            docs,
+        )),
+        DataType::Dictionary(_, _) => build_dictionary_array(
+            fast_fields,
+            field,
+            name,
+            read_name,
+            num_docs,
+            docs,
+            dict_cache,
+        ),
+        DataType::Utf8 => build_utf8_array(fast_fields, field, read_name, num_docs, docs),
+        DataType::Binary => build_binary_array(fast_fields, field, read_name, num_docs, docs),
         dt @ DataType::List(inner) => {
-            build_list_array(inner, dt, name, fast_fields, docs, num_docs)
+            build_list_array(inner, dt, read_name, fast_fields, docs, num_docs)
         }
         other => Err(DataFusionError::Internal(format!(
             "Unsupported Arrow data type for fast field '{name}': {other:?}"
@@ -173,8 +182,8 @@ fn build_u64_array(
     name: &str,
     num_docs: usize,
     docs: &[u32],
-) -> Result<ArrayRef> {
-    Ok(match fast_fields.u64(name) {
+) -> ArrayRef {
+    match fast_fields.u64(name) {
         Ok(col) => {
             let mut builder = UInt64Builder::with_capacity(num_docs);
             for &doc_id in docs {
@@ -186,7 +195,7 @@ fn build_u64_array(
             Arc::new(builder.finish())
         }
         Err(_) => arrow::array::new_null_array(&DataType::UInt64, num_docs),
-    })
+    }
 }
 
 fn build_i64_array(
@@ -194,8 +203,8 @@ fn build_i64_array(
     name: &str,
     num_docs: usize,
     docs: &[u32],
-) -> Result<ArrayRef> {
-    Ok(match fast_fields.i64(name) {
+) -> ArrayRef {
+    match fast_fields.i64(name) {
         Ok(col) => {
             let mut builder = Int64Builder::with_capacity(num_docs);
             for &doc_id in docs {
@@ -207,7 +216,7 @@ fn build_i64_array(
             Arc::new(builder.finish())
         }
         Err(_) => arrow::array::new_null_array(&DataType::Int64, num_docs),
-    })
+    }
 }
 
 fn build_f64_array(
@@ -215,8 +224,8 @@ fn build_f64_array(
     name: &str,
     num_docs: usize,
     docs: &[u32],
-) -> Result<ArrayRef> {
-    Ok(match fast_fields.f64(name) {
+) -> ArrayRef {
+    match fast_fields.f64(name) {
         Ok(col) => {
             let mut builder = Float64Builder::with_capacity(num_docs);
             for &doc_id in docs {
@@ -228,7 +237,7 @@ fn build_f64_array(
             Arc::new(builder.finish())
         }
         Err(_) => arrow::array::new_null_array(&DataType::Float64, num_docs),
-    })
+    }
 }
 
 fn build_bool_array(
@@ -236,8 +245,8 @@ fn build_bool_array(
     name: &str,
     num_docs: usize,
     docs: &[u32],
-) -> Result<ArrayRef> {
-    Ok(match fast_fields.bool(name) {
+) -> ArrayRef {
+    match fast_fields.bool(name) {
         Ok(col) => {
             let mut builder = BooleanBuilder::with_capacity(num_docs);
             for &doc_id in docs {
@@ -249,7 +258,7 @@ fn build_bool_array(
             Arc::new(builder.finish())
         }
         Err(_) => arrow::array::new_null_array(&DataType::Boolean, num_docs),
-    })
+    }
 }
 
 fn build_timestamp_array(
@@ -257,8 +266,8 @@ fn build_timestamp_array(
     name: &str,
     num_docs: usize,
     docs: &[u32],
-) -> Result<ArrayRef> {
-    Ok(match fast_fields.date(name) {
+) -> ArrayRef {
+    match fast_fields.date(name) {
         Ok(col) => {
             let mut builder = TimestampMicrosecondBuilder::with_capacity(num_docs);
             for &doc_id in docs {
@@ -273,23 +282,24 @@ fn build_timestamp_array(
             &DataType::Timestamp(TimeUnit::Microsecond, None),
             num_docs,
         ),
-    })
+    }
 }
 
 fn build_dictionary_array(
     fast_fields: &tantivy::fastfield::FastFieldReaders,
     field: &Arc<Field>,
-    name: &str,
+    alias_name: &str,
+    read_name: &str,
     num_docs: usize,
     docs: &[u32],
     dict_cache: Option<&DictCache>,
 ) -> Result<ArrayRef> {
-    let str_col = match fast_fields.str(name) {
+    let str_col = match fast_fields.str(read_name) {
         Ok(Some(col)) => col,
         _ => return Ok(arrow::array::new_null_array(field.data_type(), num_docs)),
     };
 
-    if let Some(values) = dict_cache.and_then(|cache| cache.get(name)) {
+    if let Some(values) = dict_cache.and_then(|cache| cache.get(alias_name)) {
         let ords_col = str_col.ords();
         let mut ord_buf: Vec<Option<u64>> = vec![None; num_docs];
         ords_col.first_vals(docs, &mut ord_buf);
@@ -297,7 +307,7 @@ fn build_dictionary_array(
         let mut keys_builder = Int32Builder::with_capacity(num_docs);
         for ord in &ord_buf {
             match ord {
-                Some(o) => keys_builder.append_value(*o as i32),
+                Some(o) => keys_builder.append_value(checked_i32_key(*o, alias_name)?),
                 None => keys_builder.append_null(),
             }
         }
@@ -309,7 +319,7 @@ fn build_dictionary_array(
         ));
     }
 
-    build_compact_dict_array(&str_col, docs, num_docs, name)
+    build_compact_dict_array(&str_col, docs, num_docs, read_name)
 }
 
 fn build_utf8_array(
@@ -318,8 +328,24 @@ fn build_utf8_array(
     name: &str,
     num_docs: usize,
     docs: &[u32],
-) -> ArrayRef {
-    if let Ok(col) = fast_fields.ip_addr(name) {
+) -> Result<ArrayRef> {
+    if let Ok(Some(str_col)) = fast_fields.str(name) {
+        let mut builder = StringBuilder::with_capacity(num_docs, num_docs * 16);
+        let mut buf = String::new();
+        for &doc_id in docs {
+            let mut ords = str_col.term_ords(doc_id);
+            if let Some(ord) = ords.next() {
+                buf.clear();
+                str_col
+                    .ord_to_str(ord, &mut buf)
+                    .map_err(|e| DataFusionError::Internal(format!("ord_to_str '{name}': {e}")))?;
+                builder.append_value(&buf);
+            } else {
+                builder.append_null();
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    } else if let Ok(col) = fast_fields.ip_addr(name) {
         let mut builder = StringBuilder::with_capacity(num_docs, num_docs * 40);
         for &doc_id in docs {
             match col.first(doc_id) {
@@ -333,9 +359,9 @@ fn build_utf8_array(
                 None => builder.append_null(),
             }
         }
-        Arc::new(builder.finish())
+        Ok(Arc::new(builder.finish()))
     } else {
-        arrow::array::new_null_array(field.data_type(), num_docs)
+        Ok(arrow::array::new_null_array(field.data_type(), num_docs))
     }
 }
 
@@ -367,6 +393,29 @@ fn build_binary_array(
     Ok(Arc::new(builder.finish()))
 }
 
+fn null_list_array(list_data_type: &DataType, num_docs: usize) -> ArrayRef {
+    arrow::array::new_null_array(list_data_type, num_docs)
+}
+
+fn build_list_from_values<ValueBuilder, Values, Value>(
+    mut builder: ListBuilder<ValueBuilder>,
+    docs: &[u32],
+    mut values_for_doc: impl FnMut(u32) -> Values,
+    mut append: impl FnMut(&mut ValueBuilder, Value),
+) -> ArrayRef
+where
+    ValueBuilder: ArrayBuilder,
+    Values: IntoIterator<Item = Value>,
+{
+    for &doc_id in docs {
+        for val in values_for_doc(doc_id) {
+            append(builder.values(), val);
+        }
+        builder.append(true);
+    }
+    Arc::new(builder.finish())
+}
+
 /// Build a `ListArray` for a multi-valued fast field, dispatching on the inner type.
 ///
 /// `list_data_type` is the full `DataType::List(...)` used to construct null arrays
@@ -380,131 +429,134 @@ fn build_list_array(
     num_docs: usize,
 ) -> Result<ArrayRef> {
     match inner_field.data_type() {
-        DataType::UInt64 => match fast_fields.u64(name) {
-            Ok(col) => {
-                let mut builder = ListBuilder::new(UInt64Builder::new());
-                for &doc_id in docs {
-                    for val in col.values_for_doc(doc_id) {
-                        builder.values().append_value(val);
-                    }
-                    builder.append(true);
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-            Err(_) => Ok(arrow::array::new_null_array(list_data_type, num_docs)),
-        },
-        DataType::Int64 => match fast_fields.i64(name) {
-            Ok(col) => {
-                let mut builder = ListBuilder::new(Int64Builder::new());
-                for &doc_id in docs {
-                    for val in col.values_for_doc(doc_id) {
-                        builder.values().append_value(val);
-                    }
-                    builder.append(true);
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-            Err(_) => Ok(arrow::array::new_null_array(list_data_type, num_docs)),
-        },
-        DataType::Float64 => match fast_fields.f64(name) {
-            Ok(col) => {
-                let mut builder = ListBuilder::new(Float64Builder::new());
-                for &doc_id in docs {
-                    for val in col.values_for_doc(doc_id) {
-                        builder.values().append_value(val);
-                    }
-                    builder.append(true);
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-            Err(_) => Ok(arrow::array::new_null_array(list_data_type, num_docs)),
-        },
-        DataType::Boolean => match fast_fields.bool(name) {
-            Ok(col) => {
-                let mut builder = ListBuilder::new(BooleanBuilder::new());
-                for &doc_id in docs {
-                    for val in col.values_for_doc(doc_id) {
-                        builder.values().append_value(val);
-                    }
-                    builder.append(true);
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-            Err(_) => Ok(arrow::array::new_null_array(list_data_type, num_docs)),
-        },
-        DataType::Timestamp(TimeUnit::Microsecond, None) => match fast_fields.date(name) {
-            Ok(col) => {
-                let mut builder = ListBuilder::new(TimestampMicrosecondBuilder::new());
-                for &doc_id in docs {
-                    for val in col.values_for_doc(doc_id) {
-                        builder.values().append_value(val.into_timestamp_micros());
-                    }
-                    builder.append(true);
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-            Err(_) => Ok(arrow::array::new_null_array(list_data_type, num_docs)),
-        },
-        DataType::Utf8 => {
-            // Could be a Str fast field or IpAddr formatted as string
-            if let Ok(Some(str_col)) = fast_fields.str(name) {
-                let mut builder = ListBuilder::new(StringBuilder::new());
-                let mut buf = String::new();
-                for &doc_id in docs {
-                    for ord in str_col.term_ords(doc_id) {
-                        buf.clear();
-                        str_col.ord_to_str(ord, &mut buf).map_err(|e| {
-                            DataFusionError::Internal(format!("ord_to_str '{name}': {e}"))
-                        })?;
-                        builder.values().append_value(&buf);
-                    }
-                    builder.append(true);
-                }
-                Ok(Arc::new(builder.finish()))
-            } else if let Ok(col) = fast_fields.ip_addr(name) {
-                let mut builder = ListBuilder::new(StringBuilder::new());
-                for &doc_id in docs {
-                    for val in col.values_for_doc(doc_id) {
-                        if let Some(v4) = val.to_ipv4_mapped() {
-                            builder.values().append_value(v4.to_string());
-                        } else {
-                            builder.values().append_value(val.to_string());
-                        }
-                    }
-                    builder.append(true);
-                }
-                Ok(Arc::new(builder.finish()))
-            } else {
-                // Field not present in this segment (schema evolution) — null array
-                Ok(arrow::array::new_null_array(list_data_type, num_docs))
-            }
-        }
+        DataType::UInt64 => fast_fields.u64(name).map_or_else(
+            |_| Ok(null_list_array(list_data_type, num_docs)),
+            |col| {
+                Ok(build_list_from_values(
+                    ListBuilder::new(UInt64Builder::new()),
+                    docs,
+                    |doc_id| col.values_for_doc(doc_id),
+                    UInt64Builder::append_value,
+                ))
+            },
+        ),
+        DataType::Int64 => fast_fields.i64(name).map_or_else(
+            |_| Ok(null_list_array(list_data_type, num_docs)),
+            |col| {
+                Ok(build_list_from_values(
+                    ListBuilder::new(Int64Builder::new()),
+                    docs,
+                    |doc_id| col.values_for_doc(doc_id),
+                    Int64Builder::append_value,
+                ))
+            },
+        ),
+        DataType::Float64 => fast_fields.f64(name).map_or_else(
+            |_| Ok(null_list_array(list_data_type, num_docs)),
+            |col| {
+                Ok(build_list_from_values(
+                    ListBuilder::new(Float64Builder::new()),
+                    docs,
+                    |doc_id| col.values_for_doc(doc_id),
+                    Float64Builder::append_value,
+                ))
+            },
+        ),
+        DataType::Boolean => fast_fields.bool(name).map_or_else(
+            |_| Ok(null_list_array(list_data_type, num_docs)),
+            |col| {
+                Ok(build_list_from_values(
+                    ListBuilder::new(BooleanBuilder::new()),
+                    docs,
+                    |doc_id| col.values_for_doc(doc_id),
+                    BooleanBuilder::append_value,
+                ))
+            },
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => fast_fields.date(name).map_or_else(
+            |_| Ok(null_list_array(list_data_type, num_docs)),
+            |col| {
+                Ok(build_list_from_values(
+                    ListBuilder::new(TimestampMicrosecondBuilder::new()),
+                    docs,
+                    |doc_id| col.values_for_doc(doc_id),
+                    |builder, val| builder.append_value(val.into_timestamp_micros()),
+                ))
+            },
+        ),
+        DataType::Utf8 => build_utf8_list_array(fast_fields, list_data_type, name, docs, num_docs),
         DataType::Binary => {
-            let bytes_col = match fast_fields.bytes(name) {
-                Ok(Some(col)) => col,
-                _ => {
-                    // Field not present in this segment (schema evolution) — null array
-                    return Ok(arrow::array::new_null_array(list_data_type, num_docs));
-                }
-            };
-            let mut builder = ListBuilder::new(BinaryBuilder::new());
-            let mut buf = Vec::new();
-            for &doc_id in docs {
-                for ord in bytes_col.term_ords(doc_id) {
-                    buf.clear();
-                    bytes_col.ord_to_bytes(ord, &mut buf).map_err(|e| {
-                        DataFusionError::Internal(format!("ord_to_bytes '{name}': {e}"))
-                    })?;
-                    builder.values().append_value(&buf);
-                }
-                builder.append(true);
-            }
-            Ok(Arc::new(builder.finish()))
+            build_binary_list_array(fast_fields, list_data_type, name, docs, num_docs)
         }
         other => Err(DataFusionError::Internal(format!(
             "Unsupported inner type for List fast field '{name}': {other:?}"
         ))),
     }
+}
+
+fn build_utf8_list_array(
+    fast_fields: &tantivy::fastfield::FastFieldReaders,
+    list_data_type: &DataType,
+    name: &str,
+    docs: &[u32],
+    num_docs: usize,
+) -> Result<ArrayRef> {
+    if let Ok(Some(str_col)) = fast_fields.str(name) {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        let mut buf = String::new();
+        for &doc_id in docs {
+            for ord in str_col.term_ords(doc_id) {
+                buf.clear();
+                str_col
+                    .ord_to_str(ord, &mut buf)
+                    .map_err(|e| DataFusionError::Internal(format!("ord_to_str '{name}': {e}")))?;
+                builder.values().append_value(&buf);
+            }
+            builder.append(true);
+        }
+        Ok(Arc::new(builder.finish()))
+    } else if let Ok(col) = fast_fields.ip_addr(name) {
+        Ok(build_list_from_values(
+            ListBuilder::new(StringBuilder::new()),
+            docs,
+            |doc_id| col.values_for_doc(doc_id),
+            |builder, val| {
+                if let Some(v4) = val.to_ipv4_mapped() {
+                    builder.append_value(v4.to_string());
+                } else {
+                    builder.append_value(val.to_string());
+                }
+            },
+        ))
+    } else {
+        Ok(null_list_array(list_data_type, num_docs))
+    }
+}
+
+fn build_binary_list_array(
+    fast_fields: &tantivy::fastfield::FastFieldReaders,
+    list_data_type: &DataType,
+    name: &str,
+    docs: &[u32],
+    num_docs: usize,
+) -> Result<ArrayRef> {
+    let Ok(Some(bytes_col)) = fast_fields.bytes(name) else {
+        return Ok(null_list_array(list_data_type, num_docs));
+    };
+
+    let mut builder = ListBuilder::new(BinaryBuilder::new());
+    let mut buf = Vec::new();
+    for &doc_id in docs {
+        for ord in bytes_col.term_ords(doc_id) {
+            buf.clear();
+            bytes_col
+                .ord_to_bytes(ord, &mut buf)
+                .map_err(|e| DataFusionError::Internal(format!("ord_to_bytes '{name}': {e}")))?;
+            builder.values().append_value(&buf);
+        }
+        builder.append(true);
+    }
+    Ok(Arc::new(builder.finish()))
 }
 
 /// Build a compact `DictionaryArray` from only the ordinals referenced in
@@ -550,7 +602,7 @@ fn build_compact_dict_array(
                         "dictionary ordinal {ord} missing from compact dictionary for '{name}'"
                     ))
                 })?;
-                keys_builder.append_value(compact_idx as i32);
+                keys_builder.append_value(checked_i32_key(compact_idx, name)?);
             }
             None => keys_builder.append_null(),
         }
@@ -560,4 +612,12 @@ fn build_compact_dict_array(
         DictionaryArray::<Int32Type>::try_new(keys_builder.finish(), dict_values)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
     ))
+}
+
+fn checked_i32_key(value: impl TryInto<i32>, name: &str) -> Result<i32> {
+    value.try_into().map_err(|_| {
+        DataFusionError::Internal(format!(
+            "dictionary key for fast field '{name}' exceeds Int32 capacity"
+        ))
+    })
 }

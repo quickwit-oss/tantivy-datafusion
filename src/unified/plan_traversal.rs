@@ -4,7 +4,6 @@ use datafusion::common::Result;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
-use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::projection::ProjectionExec;
@@ -16,12 +15,8 @@ use crate::unified::single_table_provider::SingleTableDataSource;
 /// Used between aggregation phases where repartitioning is expected.
 pub(crate) fn is_transparent_operator_or_repartition(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.as_any()
-        .downcast_ref::<CoalesceBatchesExec>()
+        .downcast_ref::<CoalescePartitionsExec>()
         .is_some()
-        || plan
-            .as_any()
-            .downcast_ref::<CoalescePartitionsExec>()
-            .is_some()
         || plan.as_any().downcast_ref::<CooperativeExec>().is_some()
         || plan.as_any().downcast_ref::<ProjectionExec>().is_some()
         || plan.as_any().downcast_ref::<RepartitionExec>().is_some()
